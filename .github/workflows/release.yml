@@ -14,10 +14,10 @@ permissions:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       - run: go vet ./...
@@ -26,7 +26,13 @@ jobs:
       - name: publish
         env:
           GH_TOKEN: ${{ github.token }}
+        # A release that already exists (made by hand, or by an earlier
+        # run of this tag) gets this run's files instead of failing.
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --title "remote $GITHUB_REF_NAME" \
-            --notes "Install: curl -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/scripts/install.sh | sh — checksums in checksums.txt."
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --title "remote $GITHUB_REF_NAME" \
+              --notes "Install: curl -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/scripts/install.sh | sh — checksums in checksums.txt."
+          fi
