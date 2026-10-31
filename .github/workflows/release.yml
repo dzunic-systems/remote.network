@@ -1,0 +1,32 @@
+name: release
+
+# A pushed tag vX.Y.Z builds every platform and publishes the GitHub
+# Release that scripts/install.sh downloads from: versioned binaries
+# (remote-<version>-<os>-<arch>), the stable names install.sh asks
+# releases/latest/download for (remote-<os>-<arch>), and checksums.txt.
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go test -race ./...
+      - run: make release VERSION="$GITHUB_REF_NAME"
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "remote $GITHUB_REF_NAME" \
+            --notes "Install: curl -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/scripts/install.sh | sh — checksums in checksums.txt."

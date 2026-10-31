@@ -1,0 +1,97 @@
+# Curated model catalog — canonical ids, aliases, and pinned GGUF artifacts.
+# A provisional seed list; the final list is still being chosen.
+# Canonical id convention: org/model-name.
+#
+# This file is not a serve gate. What survives here is
+# (a) the network-standard model entries below (canonical ids, aliases,
+# managed-GGUF pins — a sha256 nobody verified is not a pin) and (b) the
+# default pricing curve. Everything else a node serves is auto-collected
+# into a service card and published under "<node_id>/<raw_tag>".
+models:
+  - id: qwen/qwen3-4b
+    family: qwen3
+    display_name: Qwen3 4B
+    params_b: 4
+    default_quant: Q4_K_M
+    ctx: 32768
+    aliases: ["qwen3:4b", "qwen3-4b", "Qwen3-4B-Q4_K_M.gguf", "qwen3:4b-instruct"]
+    min_vram_mb: 3000
+    suggested_price_in_per_1m: 100000
+    suggested_price_out_per_1m: 300000
+    gguf:
+      repo: Qwen/Qwen3-4B-GGUF
+      file: Qwen3-4B-Q4_K_M.gguf
+      sha256: 7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5
+      size_bytes: 2497280256
+
+  - id: qwen/qwen3-14b
+    family: qwen3
+    display_name: Qwen3 14B
+    params_b: 14
+    default_quant: Q4_K_M
+    ctx: 32768
+    aliases: ["qwen3:14b", "qwen3-14b"]
+    min_vram_mb: 9000
+    suggested_price_in_per_1m: 200000
+    suggested_price_out_per_1m: 700000
+
+  - id: qwen/qwen3-30b
+    family: qwen3
+    display_name: Qwen3 30B
+    params_b: 30
+    default_quant: Q4_K_M
+    ctx: 32768
+    aliases: ["qwen3:30b", "qwen3-30b"]
+    min_vram_mb: 18000
+    suggested_price_in_per_1m: 300000
+    suggested_price_out_per_1m: 900000
+
+  - id: openai/gpt-oss-20b
+    family: gpt-oss
+    display_name: GPT-OSS 20B
+    params_b: 20
+    default_quant: Q4_K_M
+    ctx: 131072
+    aliases: ["gpt-oss:20b", "gpt-oss-20b"]
+    min_vram_mb: 12000
+    suggested_price_in_per_1m: 150000
+    suggested_price_out_per_1m: 600000
+
+  - id: google/gemma4-12b-it
+    family: gemma4
+    display_name: Gemma 4 12B IT
+    params_b: 12
+    default_quant: QAT
+    ctx: 131072
+    aliases: ["gemma4:12b-it-qat", "gemma4:12b", "gemma-4-12b-it"]
+    min_vram_mb: 8000
+    suggested_price_in_per_1m: 100000
+    suggested_price_out_per_1m: 400000
+
+  # Dogfood addition 2026-10-01: MoE (4B active) QAT — the sweet spot for
+  # 24 GB unified-memory Macs; verified generating on a LAN node.
+  - id: google/gemma4-26b-a4b-it
+    family: gemma4
+    display_name: Gemma 4 26B A4B IT
+    params_b: 26
+    default_quant: QAT
+    ctx: 131072
+    aliases: ["gemma4:26b-a4b-it-qat", "gemma4:26b-a4b", "gemma-4-26b-a4b-it"]
+    min_vram_mb: 17000
+    suggested_price_in_per_1m: 200000
+    suggested_price_out_per_1m: 700000
+
+# Default pricing curve: micro-USD per 1M tokens for publisher
+# cards whose operator did not set a price. First row with max_params_b >=
+# the card's params_b wins; params 0 → cheapest row. These are real
+# prices: they figure in every /v1/models entry and every usage.cost, and
+# consumers are billed exactly this. Bands track the market
+# rates of comparable open-weight models on commercial routers; tune here
+# (or per node via --price-in/--price-out) as the operator's price list
+# evolves.
+pricing:
+  curve:
+    - {max_params_b: 4, price_in_per_1m: 100000, price_out_per_1m: 300000}
+    - {max_params_b: 8, price_in_per_1m: 120000, price_out_per_1m: 400000}
+    - {max_params_b: 16, price_in_per_1m: 200000, price_out_per_1m: 700000}
+    - {max_params_b: 1000, price_in_per_1m: 300000, price_out_per_1m: 900000}

@@ -1,0 +1,4 @@
+bin/
+dist/
+*.key
+.DS_Store
