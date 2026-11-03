@@ -959,6 +959,11 @@ func (rt *Runtime) HandleInference(ctx context.Context, req wire.InferenceReques
 		if d.Usage != nil {
 			done.InputTokens, done.OutputTokens = d.Usage.InputTokens, d.Usage.OutputTokens
 		}
+		if d.ReasoningOutcome != nil {
+			done.Reasoning = d.ReasoningOutcome
+			rt.log.Info("thinking control not met", "model", card.RawID,
+				"requested", d.ReasoningOutcome.Requested, "applied", d.ReasoningOutcome.Applied)
+		}
 		if d.Content == "" && d.Reasoning == "" && d.FinishReason == "" && len(d.ToolCalls) == 0 {
 			return nil // usage-only tail deltas carry no stream payload
 		}

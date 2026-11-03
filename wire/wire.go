@@ -234,7 +234,7 @@ type JSONSchemaSpec struct {
 
 // ReasoningControl is the normalized thinking-model steering knob.
 type ReasoningControl struct {
-	Effort    string `json:"effort,omitempty"`     // off | low | medium | high
+	Effort    string `json:"effort,omitempty"`     // off | low | medium | high | xhigh
 	MaxTokens int    `json:"max_tokens,omitempty"` // budget_tokens on Anthropic
 }
 
@@ -292,6 +292,17 @@ type InferenceChunkData struct {
 type InferenceDoneData struct {
 	InputTokens  int `json:"input_tokens"`
 	OutputTokens int `json:"output_tokens"`
+	// Reasoning is set only when the request's thinking control was not met
+	// exactly. Older routers ignore it.
+	Reasoning *ReasoningOutcome `json:"reasoning,omitempty"`
+}
+
+// ReasoningOutcome says what became of a ReasoningControl the backend could
+// not meet: Applied is the nearest level it took, or "default" when the
+// backend's own default ran (nothing accepted, or accepted and not obeyed).
+type ReasoningOutcome struct {
+	Requested string `json:"requested"`
+	Applied   string `json:"applied"`
 }
 
 // EmbedRequestData asks the node to embed a batch of inputs.

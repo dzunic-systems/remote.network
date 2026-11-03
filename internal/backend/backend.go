@@ -111,6 +111,9 @@ type Delta struct {
 	FinishReason string     `json:"finish_reason,omitempty"`
 	Usage        *Usage     `json:"usage,omitempty"`
 	ToolCalls    []ToolCall `json:"tool_calls,omitempty"`
+	// ReasoningOutcome, on a final delta of its own, says the thinking control
+	// was not met exactly.
+	ReasoningOutcome *wire.ReasoningOutcome `json:"reasoning_outcome,omitempty"`
 }
 
 // Client is a backend connection.

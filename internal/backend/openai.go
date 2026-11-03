@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -30,14 +31,24 @@ type openaiClient struct {
 	mu            sync.Mutex
 	modelCtx      map[string]int
 	listed        map[string]bool
-	listTools     map[string]bool // supported_parameters names "tools" (ds4-server, OpenRouter shape)
-	listReasoning map[string]bool // …names "reasoning"/"thinking" (OpenRouter vocabulary)
+	listTools     map[string]bool   // supported_parameters names "tools" (ds4-server, OpenRouter shape)
+	listReasoning map[string]bool   // …names "reasoning"/"thinking" (OpenRouter vocabulary)
+	rungWorked    map[string]string // request shape → reasoning ladder rung to use (reasoning.go)
+	offThoughts   map[string]int    // request shape → requests in a row that thought through "off"
 
 	// /props cache (llama.cpp: default_generation_settings.n_ctx), guarded
 	// by mu. Retried until it answers (llama-server 503s while loading),
 	// then kept — llama-server serves a fixed ctx until restart.
 	propsNCtx int
 	propsDone bool
+	// chat_template_caps.reasoning_effort_levels from the same /props: known
+	// when the server reports the list.
+	propsLevelsKnown bool
+	propsLevels      []string
+
+	// LM Studio's /api/v1/models: per-model reasoning options, guarded by mu.
+	nativeOptions map[string][]string
+	nativeDone    bool
 
 	// Capability-probe state (caps.go): per-model 1-token probe results,
 	// lazily initialized. Its own mutex; allocated on first use.
@@ -97,7 +108,10 @@ func (c *openaiClient) loadProps() {
 		DefaultGenerationSettings struct {
 			NCtx int `json:"n_ctx"`
 		} `json:"default_generation_settings"`
-		NCtx int `json:"n_ctx"`
+		NCtx             int `json:"n_ctx"`
+		ChatTemplateCaps struct {
+			Levels *[]string `json:"reasoning_effort_levels"`
+		} `json:"chat_template_caps"`
 	}
 	if json.NewDecoder(resp.Body).Decode(&props) != nil {
 		return
@@ -109,6 +123,9 @@ func (c *openaiClient) loadProps() {
 	c.mu.Lock()
 	c.propsNCtx = n
 	c.propsDone = true
+	if l := props.ChatTemplateCaps.Levels; l != nil {
+		c.propsLevelsKnown, c.propsLevels = true, *l
+	}
 	c.mu.Unlock()
 }
 
@@ -175,6 +192,9 @@ func (c *openaiClient) ProbeModels(ctx context.Context) ([]string, error) {
 	c.listed = listed
 	c.listTools = tools
 	c.listReasoning = reasoning
+	if len(c.nativeOptions) > 0 {
+		c.nativeDone = false // LM Studio: the loaded models may have changed
+	}
 	c.mu.Unlock()
 	return ids, nil
 }
@@ -187,7 +207,9 @@ type oaStreamRequest struct {
 	StreamOptions   *oaStreamOpts `json:"stream_options,omitempty"`
 	Tools           []oaToolSpec  `json:"tools,omitempty"`
 	ToolChoice      any           `json:"tool_choice,omitempty"`      // string or {"type","function"}
-	ReasoningEffort string        `json:"reasoning_effort,omitempty"` // minimal|low|medium|high
+	ReasoningEffort string        `json:"reasoning_effort,omitempty"` // none|low|medium|high|xhigh (reasoning.go)
+	// ChatTemplateKwargs carries enable_thinking=false for effort "off".
+	ChatTemplateKwargs map[string]any `json:"chat_template_kwargs,omitempty"`
 	// Consumer sampling knobs: passed through when set — backends
 	// without the field ignore it, priority-scheduled vLLM orders by it.
 	Temperature *float64 `json:"temperature,omitempty"`
@@ -365,6 +387,34 @@ func oaToolChoice(choice string) any {
 	return nil
 }
 
+// postStream sends one streaming chat request; the caller owns the body. A server
+// closing a kept-alive connection just as it is reused fails the POST before any
+// reply (llama-server: 9 of 40 requests), and Go only replays that for idempotent
+// methods, so one retry here gets a fresh connection.
+func (c *openaiClient) postStream(ctx context.Context, oaReq oaStreamRequest) (*http.Response, error) {
+	body, err := json.Marshal(oaReq)
+	if err != nil {
+		return nil, err
+	}
+	do := func() (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+			c.cfg.BaseURL+"/v1/chat/completions", bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		c.auth(req)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "text/event-stream")
+		return http.DefaultClient.Do(req)
+	}
+	resp, err := do()
+	if err != nil && ctx.Err() == nil &&
+		(errors.Is(err, io.EOF) || strings.Contains(err.Error(), "server closed idle connection")) {
+		return do()
+	}
+	return resp, err
+}
+
 func (c *openaiClient) StreamChat(ctx context.Context, r ChatRequest, onDelta func(Delta) error) error {
 	msgs := make([]oaMessage, len(r.Messages))
 	for i, m := range r.Messages {
@@ -381,12 +431,17 @@ func (c *openaiClient) StreamChat(ctx context.Context, r ChatRequest, onDelta fu
 		msgs[i] = oaMessage{Role: role, Content: oaContent(m),
 			ToolCalls: oaToolCalls(m.ToolCalls), ToolCallID: m.ToolCallID}
 	}
-	effort := ""
-	if r.Reasoning != nil && r.Reasoning.Effort != "off" {
-		// "off" stays absent: OpenAI's "minimal" is not universal (some vLLM
-		// builds accept only low|medium|xhigh and 400 the rest), and every
-		// backend's own default is the safer expression of "don't force".
-		effort = map[string]string{"low": "low", "medium": "medium", "high": "high"}[r.Reasoning.Effort]
+	requested := ""
+	var options reasoningOptions
+	if r.Reasoning != nil {
+		requested = r.Reasoning.Effort
+		options = c.reasoningOptionsFor(r.Model)
+	}
+	ladder := reasoningLadder(requested, options)
+	rungKey := reasoningRungKey(r.Model, requested, len(r.Tools) > 0)
+	rung := 0
+	if requested != "" {
+		rung = c.startRung(rungKey, ladder)
 	}
 	var temperature *float64
 	if r.Temperature > 0 {
@@ -398,16 +453,17 @@ func (c *openaiClient) StreamChat(ctx context.Context, r ChatRequest, onDelta fu
 		p := r.Priority
 		priority = &p
 	}
-	body, err := json.Marshal(oaStreamRequest{
-		Model:           r.Model,
-		Messages:        msgs,
-		MaxTokens:       r.MaxTokens,
-		Stream:          true,
-		ReasoningEffort: effort,
-		Temperature:     temperature,
-		Priority:        priority,
-		ResponseFormat:  oaResponseFormatOf(r.ResponseFormat),
-		Tools:           oaTools(r.Tools),
+	oaReq := oaStreamRequest{
+		Model:              r.Model,
+		Messages:           msgs,
+		MaxTokens:          r.MaxTokens,
+		Stream:             true,
+		ReasoningEffort:    ladder[rung].effort,
+		ChatTemplateKwargs: ladder[rung].kwargs,
+		Temperature:        temperature,
+		Priority:           priority,
+		ResponseFormat:     oaResponseFormatOf(r.ResponseFormat),
+		Tools:              oaTools(r.Tools),
 		ToolChoice: func() any {
 			if v := oaToolChoice(r.ToolChoice); v != nil {
 				return v
@@ -417,29 +473,32 @@ func (c *openaiClient) StreamChat(ctx context.Context, r ChatRequest, onDelta fu
 		// Standard OpenAI field; Ollama/vLLM/LM Studio accept it and it
 		// gives bench an honest usage cross-check.
 		StreamOptions: &oaStreamOpts{IncludeUsage: true},
-	})
+	}
+	resp, err := c.postStream(ctx, oaReq)
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		c.cfg.BaseURL+"/v1/chat/completions", bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	c.auth(req)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "text/event-stream")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
+	// A refused thinking control is not a failed request: walk to the nearest
+	// level the server takes. The rung is remembered only once one is accepted,
+	// since a request that is bad for another reason fails all the way down.
+	for start := rung; (resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusUnprocessableEntity) && rung+1 < len(ladder); {
+		resp.Body.Close()
+		rung++
+		oaReq.ReasoningEffort, oaReq.ChatTemplateKwargs = ladder[rung].effort, ladder[rung].kwargs
+		if resp, err = c.postStream(ctx, oaReq); err != nil {
+			return err
+		}
+		if resp.StatusCode == http.StatusOK && rung != start {
+			c.rememberRung(rungKey, ladder[rung])
+		}
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("stream %s %s: %s", c.cfg.BaseURL, r.Model, httpStatus(resp))
 	}
 	var toolAcc []ToolCall // indexed accumulation across fragments
-	return scanSSE(resp.Body, func(data []byte) (bool, error) {
+	var seen thinkingSeen
+	err = scanSSE(resp.Body, func(data []byte) (bool, error) {
 		if string(data) == "[DONE]" {
 			return false, nil
 		}
@@ -490,11 +549,22 @@ func (c *openaiClient) StreamChat(ctx context.Context, r ChatRequest, onDelta fu
 		if d.Content == "" && d.Reasoning == "" && d.FinishReason == "" && d.Usage == nil && len(d.ToolCalls) == 0 {
 			return true, nil
 		}
+		seen.observe(d)
 		if err := onDelta(d); err != nil {
 			return false, err
 		}
 		return true, nil
 	})
+	if err != nil || requested == "" {
+		return err
+	}
+	if ladder[rung].applied == "off" && c.noteOff(rungKey, seen.thought()) {
+		c.rememberRung(rungKey, ladder[firstRungPast(ladder)])
+	}
+	if o := reasoningOutcome(requested, ladder[rung], seen.thought()); o != nil {
+		return onDelta(Delta{ReasoningOutcome: o})
+	}
+	return nil
 }
 
 func (c *openaiClient) auth(req *http.Request) {

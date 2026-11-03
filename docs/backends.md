@@ -79,7 +79,7 @@ Ollama on another machine in your network (start it there with
 `OLLAMA_HOST=0.0.0.0`):
 
 ```sh
-remote node start … --backend-url http://192.168.1.50:11434/v1
+remote node start … --backend-url http://gpu-box.local:11434/v1
 ```
 
 ## vLLM
@@ -145,7 +145,7 @@ for a big one, an older box on the LAN. Register them once:
 ```sh
 remote backend add --id ollama                                # local Ollama (default URL)
 remote backend add --id vllm --url http://localhost:8000/v1 --model Qwen/Qwen3-32B
-remote backend add --id lan --url http://192.168.1.50:11434/v1
+remote backend add --id lan --url http://gpu-box.local:11434/v1
 remote backend list
 remote backend remove lan
 ```
