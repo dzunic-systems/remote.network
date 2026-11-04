@@ -21,6 +21,7 @@ import (
 	"remote.network/node/internal/backends"
 	"remote.network/node/internal/bench"
 	"remote.network/node/internal/hardware"
+	"remote.network/node/internal/schedule"
 	"remote.network/node/internal/serve"
 )
 
@@ -126,6 +127,8 @@ func newStartCommand() *cobra.Command {
 		simulateSymNat bool
 		priceIn        int
 		priceOut       int
+		serveHours     []string
+		serveTZ        string
 	)
 	cmd := &cobra.Command{
 		Use:   "start",
@@ -135,6 +138,10 @@ func newStartCommand() *cobra.Command {
 				if err := validateRouterURL(u); err != nil {
 					return fmt.Errorf("--router %q: %w", u, err)
 				}
+			}
+			sched, err := schedule.Parse(serveHours, serveTZ)
+			if err != nil {
+				return err
 			}
 			log := newLogger()
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
@@ -201,6 +208,12 @@ func newStartCommand() *cobra.Command {
 			runCtx, stopRun := context.WithCancel(context.Background())
 			defer stopRun()
 
+			gate := &servingGate{sched: sched, now: time.Now, models: rt.ServingModelIDs, log: log}
+			var handler ingress.InferenceHandler = rt // serve.Runtime answers inference + embedding dispatches
+			if sched != nil {
+				handler = scheduledHandler{servingHandler: rt, gate: gate}
+			}
+
 			fleet := ingress.NewFleet(ingress.FleetConfig{
 				Seeds:  routerURLs,
 				Strict: routerStrict,
@@ -219,24 +232,27 @@ func newStartCommand() *cobra.Command {
 					Capability: func() (json.RawMessage, error) {
 						return rt.Advertisement(hwJSON), nil
 					},
-					Handler:           rt, // serve.Runtime answers inference + embedding dispatches
+					Handler:           handler,
 					Direct:            !noDirect,
 					NoReverseQUIC:     noReverseQUIC,
 					SimulateSymmetric: simulateSymNat,
 				},
 				Log: log,
 			})
-			fleet.SetServingModels(rt.ServingModelIDs())
+			gate.set = fleet.SetServingModels
+			gate.notify = fleet.SendCapabilityUpdate
+			openNow := gate.apply()
+			if sched != nil {
+				log.Info("serving hours set", "hours", sched.String(), "open_now", openNow, "next_change", gate.nextChange())
+				go gate.run(ctx, 5*time.Second)
+			}
 
 			// Keep-warm: load the pinned models once, in the background —
 			// the cold-load window becomes a startup event instead of a
 			// first-request failure. State flips ride SendCapabilityUpdate —
 			// and so does a late backend admission (--retry-backends), which
 			// must also move the heartbeat's serving list.
-			rt.OnChange(func() {
-				fleet.SetServingModels(rt.ServingModelIDs())
-				fleet.SendCapabilityUpdate()
-			})
+			rt.OnChange(func() { gate.advertise() })
 			go rt.Warm(runCtx)
 
 			// Residency refresh: what the backend actually has in memory
@@ -273,7 +289,7 @@ func newStartCommand() *cobra.Command {
 						case <-t.C:
 							refreshCtx, cancel := context.WithTimeout(runCtx, 5*time.Minute)
 							if rt.Refresh(refreshCtx) {
-								if fleet.SendCapabilityUpdate() {
+								if gate.advertise() {
 									log.Info("model set changed — capability update sent")
 								}
 							}
@@ -320,6 +336,10 @@ func newStartCommand() *cobra.Command {
 		"pin the company root public key (base32) — certified routers chaining to it are trusted, so router key rotation needs no node action; supersets --router-key when a router serves a certificate")
 	cmd.Flags().StringVar(&nodeToken, "node-token", "",
 		"claim this node for your dashboard account (rn_nt_… — mint one on the Nodes tab)")
+	cmd.Flags().StringArrayVar(&serveHours, "serve-hours", nil,
+		"offer models only in these hours, repeatable: 22:00-07:00, mon-fri@20:00-07:00, sat,sun@00:00-24:00 (default: always). Outside them the agent stays connected and takes no new requests")
+	cmd.Flags().StringVar(&serveTZ, "serve-tz", "",
+		"time zone for --serve-hours, such as Asia/Dubai (default: this machine's)")
 	cmd.Flags().BoolVar(&skipBench, "skip-bench", false,
 		"skip startup benchmark (advertises ready-unbenched)")
 	cmd.Flags().BoolVar(&reprobe, "reprobe", false,

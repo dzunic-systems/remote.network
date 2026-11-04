@@ -125,6 +125,27 @@ remote node start \
   line is visible to other users of the machine in the process list; the
   service scripts read it from a file instead.
 
+### Choose when the machine serves
+
+By default a node offers its models all the time. To keep the machine for your
+own work during the day, set serving hours:
+
+```sh
+remote node start … --serve-hours 22:00-07:00
+remote node start … --serve-hours mon-fri@20:00-07:00 --serve-hours sat,sun@00:00-24:00
+remote node start … --serve-hours 22:00-07:00 --serve-tz Asia/Dubai
+```
+
+Hours use this machine's clock unless you pass `--serve-tz`. A window that
+ends before it starts runs past midnight and belongs to the day it starts on.
+Outside the hours the agent stays connected and takes no new requests; requests
+already running finish. The agent does not unload models, so a model your
+backend keeps in memory still holds that memory during the day.
+
+The service scripts pass these on: `service.sh install -- --serve-hours
+22:00-07:00` on macOS and Linux, `setup-windows.ps1 -ExtraArgs "--serve-hours
+22:00-07:00"` on Windows.
+
 `remote node status` prints this node's id, its router pin and the last
 known state. `remote node start --help` lists every flag; the ones you are
 likely to need are in [docs/backends.md](docs/backends.md#flag-reference).

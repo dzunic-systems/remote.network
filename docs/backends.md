@@ -190,6 +190,7 @@ qualify (today: `qwen3:4b`). Files go to `~/.remote`.
 | `--backend-url` / `--backend-kind` / `--backend-api-key` | Ollama | One backend for this run (overrides the registry). |
 | `--serving-ctx model=tokens` | from backend | Pin or cap a model's context window. |
 | `--tool-capable`, `--vision-capable`, `--thinking-capable` | probed | Declare a capability the backend cannot report. |
+| `--serve-hours`, `--serve-tz` | always, machine's zone | Offer models only in these hours, such as `22:00-07:00` or `mon-fri@20:00-07:00` (repeatable). Outside them the agent stays connected and takes no new requests. |
 | `--keep-warm` | `pinned` | Preload `pinned` (`--model`) models, `all`, or `none`. |
 | `--skip-bench` | off | Start serving without benchmarking (cards say unbenched). |
 | `--reprobe` | off | Ignore the probe cache: re-probe and re-benchmark every model. |
