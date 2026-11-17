@@ -138,17 +138,29 @@ func (c *Catalog) CurvePrice(paramsB float64) (priceIn, priceOut int) {
 
 // NetworkPrice looks a raw backend tag up in the network price list:
 // exact match after lower-casing, also trying with a trailing ":latest"
-// stripped or added (Ollama tags use it inconsistently). Miss → ok=false.
+// stripped or added (Ollama tags use it inconsistently), then the same
+// for the tag without its Ollama user namespace. Miss → ok=false.
 func (c *Catalog) NetworkPrice(rawTag string) (priceIn, priceOut int, ok bool) {
 	if len(c.NetworkPrices) == 0 {
 		return 0, 0, false
 	}
 	key := strings.ToLower(strings.TrimSpace(rawTag))
-	try := []string{key}
-	if base, has := strings.CutSuffix(key, ":latest"); has {
-		try = append(try, base)
-	} else {
-		try = append(try, key+":latest")
+	var try []string
+	add := func(k string) {
+		try = append(try, k)
+		if base, has := strings.CutSuffix(k, ":latest"); has {
+			try = append(try, base)
+		} else {
+			try = append(try, k+":latest")
+		}
+	}
+	add(key)
+	// Ollama user namespaces ("qllama/multilingual-e5-large-instruct") name
+	// the same weights as the bare tag the card id is built from; the
+	// namespaced spelling is tried first, so a list entry can still single
+	// one namespace out.
+	if i := strings.LastIndex(key, "/"); i >= 0 && i < len(key)-1 {
+		add(key[i+1:])
 	}
 	for _, t := range try {
 		for i := range c.NetworkPrices {

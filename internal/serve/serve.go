@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -372,6 +373,23 @@ func (rt *Runtime) materializeCard(ctx context.Context, spec BackendSpec,
 			Family: cached.Family, Quant: cached.Quant, ParamsB: cached.ParamsB,
 			Ctx: cached.Ctx, SizeBytes: int64(cached.SizeMB) << 20,
 			Capabilities: cached.Capabilities, Efforts: cached.Efforts,
+		}
+		// What the listing states is re-read on every hit: it was fetched
+		// this start anyway, and an entry written by an older agent may
+		// predate the fields (v0.1.3 → v0.1.4 lost the Sparks' thinking).
+		if lf, ok := client.(backend.ListingFacter); ok {
+			if thinking, efforts, ok := lf.ListingFacts(raw); ok {
+				if thinking && !slices.Contains(meta.Capabilities, "thinking") {
+					meta.Capabilities = append(slices.Clone(meta.Capabilities), "thinking")
+				}
+				if len(efforts) > 0 {
+					meta.Efforts = efforts
+				}
+				if !slices.Equal(meta.Capabilities, cached.Capabilities) || !slices.Equal(meta.Efforts, cached.Efforts) {
+					cached.Capabilities, cached.Efforts = meta.Capabilities, meta.Efforts
+					rt.cache.Put(key, cached)
+				}
+			}
 		}
 		card := buildCard(opts, rt.cat, rt.m, spec, raw, meta, cached.Modality, kind)
 		card.State = cached.State

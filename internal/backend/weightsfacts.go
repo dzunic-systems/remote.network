@@ -18,6 +18,26 @@ type WeightsProvenance interface {
 	WeightsFacts(ctx context.Context, model string) (digest, root, path string)
 }
 
+// ListingFacter is implemented by backends whose model listing states
+// thinking support itself (TensorFold's reasoning object). The listing is
+// fetched on every start, so a probe-cache hit can re-read these facts
+// instead of replaying a cache entry written before they were captured.
+type ListingFacter interface {
+	// ListingFacts reports what the last listing said about one model:
+	// thinking support and its effort vocabulary ("none" already dropped).
+	// ok=false when the listing said nothing about thinking.
+	ListingFacts(model string) (thinking bool, efforts []string, ok bool)
+}
+
+// ListingFacts implements ListingFacter from the last ProbeModels listing.
+func (c *openaiClient) ListingFacts(model string) (thinking bool, efforts []string, ok bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	thinking = c.listReasoning[model]
+	efforts = append([]string(nil), c.listEfforts[model]...)
+	return thinking, efforts, thinking || len(efforts) > 0
+}
+
 // WeightsFacts collects the three sources. All are best-effort with the
 // probe-path timeouts: a backend that cannot answer leaves the field
 // empty and the card simply carries no weights id from that tier.

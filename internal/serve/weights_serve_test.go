@@ -3,6 +3,7 @@ package serve
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -207,7 +208,10 @@ func TestGGUFWeightsBackground(t *testing.T) {
 		_, _ = w.Write([]byte(`{"data":[{"id":"local-model"}]}`))
 	})
 	mux.HandleFunc("GET /props", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(`{"default_generation_settings":{"n_ctx":8192},"model_path":"` + gguf + `"}`))
+		// json.Marshal quotes the path: a Windows temp dir's backslashes
+		// would otherwise be invalid JSON escapes.
+		q, _ := json.Marshal(gguf)
+		_, _ = w.Write([]byte(`{"default_generation_settings":{"n_ctx":8192},"model_path":` + string(q) + `}`))
 	})
 	mux.HandleFunc("POST /api/show", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
@@ -353,5 +357,61 @@ func TestOllamaRepullNotStaleOnCacheHit(t *testing.T) {
 	got := start()
 	if got.WeightsID != "ollama:sha256:"+digest || got.WeightsFingerprint != digest {
 		t.Fatalf("cache hit replayed a stale identity: %q / %q", got.WeightsID, got.WeightsFingerprint)
+	}
+}
+
+// TestCacheHitRereadsListingFacts: a probe-cache entry written before the
+// agent captured TensorFold's reasoning object (v0.1.3) has no thinking
+// and no efforts; a v0.1.5 restart re-reads them from the listing it
+// fetches anyway — no --reprobe — and refreshes the entry.
+func TestCacheHitRereadsListingFacts(t *testing.T) {
+	const raw = "tf-qwen38-flash"
+	home := t.TempDir()
+	url := tensorFoldFake(t, raw).URL
+	start := func() ServedModel {
+		t.Helper()
+		rt, err := Prepare(t.Context(), Options{
+			Home: home, NodeID: testNodeID, SkipBench: true,
+			Backends: []BackendSpec{{ID: "tf", Kind: "openai-compatible", URL: url}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rt.Close()
+		return rt.Models[0]
+	}
+	start() // writes the cache entry
+
+	// Age the entry into what v0.1.3 wrote: no capabilities, no efforts.
+	path := filepath.Join(home, "probe-cache.json")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var f struct {
+		Entries map[string]CachedModel `json:"entries"`
+	}
+	if err := json.Unmarshal(b, &f); err != nil || len(f.Entries) != 1 {
+		t.Fatalf("cache file: %v (%d entries)", err, len(f.Entries))
+	}
+	for k, e := range f.Entries {
+		e.Capabilities, e.Efforts = nil, nil
+		f.Entries[k] = e
+	}
+	if b, err = json.Marshal(f); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	card := start()
+	if !card.Reasoning || strings.Join(card.ReasoningEfforts, ",") != "xhigh,medium,low" {
+		t.Fatalf("cache hit lost the listing's facts: reasoning=%v efforts=%v", card.Reasoning, card.ReasoningEfforts)
+	}
+	// The refreshed entry carries them for the next start too.
+	b, _ = os.ReadFile(path)
+	if !strings.Contains(string(b), `"thinking"`) || !strings.Contains(string(b), `"xhigh"`) {
+		t.Fatalf("cache entry not refreshed: %s", b)
 	}
 }

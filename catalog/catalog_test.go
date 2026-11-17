@@ -152,3 +152,25 @@ func TestResolveQwen38(t *testing.T) {
 		}
 	}
 }
+
+// TestNetworkPriceOllamaNamespace: an Ollama user-namespaced tag prices as
+// its bare tag (the card id drops the namespace too) — the live miss of
+// 2026-11-17 was qllama/multilingual-e5-large-instruct:latest.
+func TestNetworkPriceOllamaNamespace(t *testing.T) {
+	c, err := Default()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, raw := range []string{
+		"qllama/multilingual-e5-large-instruct:latest",
+		"qllama/multilingual-e5-large-instruct",
+		"multilingual-e5-large-instruct",
+	} {
+		if in, out, ok := c.NetworkPrice(raw); !ok || in != 5000 || out != 0 {
+			t.Fatalf("NetworkPrice(%q) = %d/%d ok=%v, want 5000/0", raw, in, out, ok)
+		}
+	}
+	if _, _, ok := c.NetworkPrice("qllama/"); ok {
+		t.Fatal("a bare namespace must not match")
+	}
+}

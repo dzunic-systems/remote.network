@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -216,6 +217,7 @@ func writeRepo(t *testing.T, cache, repo, rev string, blobs map[string]string,
 			t.Fatal(err)
 		}
 		if err := os.Symlink(rel, target); err != nil {
+			skipNoSymlink(t, err)
 			t.Fatal(err)
 		}
 	}
@@ -299,6 +301,7 @@ func TestFingerprintGolden(t *testing.T) {
 	// A dangling symlink (the unmounted-volume case) voids the fingerprint.
 	snap := filepath.Join(cache, "models--nvidia--stock", "snapshots", revBase)
 	if err := os.Symlink(filepath.Join("..", "..", "blobs", "gone"), filepath.Join(snap, "broken.bin")); err != nil {
+		skipNoSymlink(t, err)
 		t.Fatal(err)
 	}
 	warns = nil
@@ -420,5 +423,16 @@ func TestGGUFHashInflightDedupe(t *testing.T) {
 	}
 	if len(h.inflight) != 0 {
 		t.Fatalf("inflight not cleared: %d", len(h.inflight))
+	}
+}
+
+// skipNoSymlink skips a test on Windows when the account may not create
+// symlinks (no Developer Mode, not elevated) — the HF hub cache itself
+// falls back to plain copies there, which the fingerprint handles by
+// reading the files; the symlink layout is covered on Linux and macOS.
+func skipNoSymlink(t *testing.T, err error) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skipf("symlinks unavailable on this Windows account: %v", err)
 	}
 }
