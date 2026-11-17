@@ -369,8 +369,13 @@ type ServedModel struct {
 	MaxConcurrent int     `json:"max_concurrent"`
 	PriceInPer1M  int     `json:"price_in_per_1m"`  // micro-USD per 1M tokens; what metering really bills
 	PriceOutPer1M int     `json:"price_out_per_1m"` // micro-USD
-	BackendKind   string  `json:"backend_kind"`
-	BackendURL    string  `json:"backend_url"`
+	// PriceSource says who set the price: "operator" when --price-in or
+	// --price-out was given, "default" when the node priced it itself
+	// (catalog suggested / curve). Older nodes send nothing; the router
+	// then judges by shape (nodelink's network-price intake).
+	PriceSource string `json:"price_source,omitempty"`
+	BackendKind string `json:"backend_kind"`
+	BackendURL  string `json:"backend_url"`
 
 	// Card facts, self-collected by the agent (all optional —
 	// omitted on older agents, which the router treats as chat-modality
@@ -434,6 +439,17 @@ type ServedModel struct {
 	// honesty anchor for "is this really the model the card claims".
 	// Empty or 64 lowercase hex; anything else is cleared at intake.
 	WeightsSHA256 string `json:"weights_sha256,omitempty"`
+	// WeightsID is the declared source of the weights, one of:
+	//   hf:<org>/<name>@<rev40>[+<org>/<name>@<rev40>:<path>]...   (base + overlays)
+	//   ollama:sha256:<hex64>                                       (Ollama manifest digest)
+	//   gguf:sha256:<hex64>                                         (one GGUF file)
+	// Additive on node v0.1.4: old routers ignore it, old nodes send none.
+	WeightsID string `json:"weights_id,omitempty"`
+	// WeightsFingerprint is sha256 (hex64) over the sorted lines
+	// "<path>\t<sha256 hex of that file>\n" of every content file the backend
+	// loads. For ollama:/gguf: ids it is the digest itself; empty when the
+	// snapshot is not on the node's disk.
+	WeightsFingerprint string `json:"weights_fingerprint,omitempty"`
 }
 
 // Modality constants for ServedModel.Modality. The empty string means chat

@@ -23,6 +23,7 @@ import (
 	"remote.network/node/internal/hardware"
 	"remote.network/node/internal/schedule"
 	"remote.network/node/internal/serve"
+	"remote.network/node/internal/weights"
 )
 
 // backendFlags are shared by `node start` and `node bench`. They are the
@@ -121,6 +122,8 @@ func newStartCommand() *cobra.Command {
 		visionCapable  []string
 		thinkCapable   []string
 		thinkEfforts   map[string]string
+		weightsDecls   map[string]string
+		hfCache        string
 		maxConc        int
 		noDirect       bool
 		noReverseQUIC  bool
@@ -160,6 +163,9 @@ func newStartCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if err := validateWeightsDecls(weightsDecls); err != nil {
+				return err
+			}
 
 			log.Info("node agent starting",
 				"node_id", nodeID,
@@ -192,6 +198,8 @@ func newStartCommand() *cobra.Command {
 				VisionCapable:       visionCapable,
 				ThinkingCapable:     thinkCapable,
 				EffortsCapable:      thinkEfforts,
+				Weights:             weightsDecls,
+				HFCache:             hfCache,
 				MaxConcurrent:       maxConc,
 				PriceInPer1M:        priceIn,
 				PriceOutPer1M:       priceOut,
@@ -364,6 +372,10 @@ func newStartCommand() *cobra.Command {
 		"force the thinking capability on a model, raw-or-card-id (repeatable — for reasoning models on backends that cannot self-report)")
 	cmd.Flags().StringToStringVar(&thinkEfforts, "thinking-efforts", nil,
 		"pin a model's accepted reasoning_effort vocabulary, raw-or-card-id=low,medium,xhigh (the probe discovers it; use this where probing cannot run or you know the recipe — consumers pick from this list instead of guessing)")
+	cmd.Flags().StringToStringVar(&weightsDecls, "weights", nil,
+		"declare a model's weights identity, raw-or-card-id=<org>/<name>@<40-hex-commit>[+<org>/<name>@<40-hex-commit>:<file>] (repeatable — for backends that cannot name their files, e.g. TensorFold; revisions must be full 40-hex commits, never a branch or a short sha)")
+	cmd.Flags().StringVar(&hfCache, "hf-cache", "",
+		"Hugging Face cache root for hf: weights lookups and fingerprints (default: $HF_HUB_CACHE, else $HF_HOME/hub, else ~/.cache/huggingface/hub)")
 	cmd.Flags().IntVar(&maxConc, "max-concurrent", 1,
 		"max concurrent inference requests this node accepts")
 	cmd.Flags().BoolVar(&noDirect, "no-direct", false,
@@ -381,7 +393,11 @@ func newStartCommand() *cobra.Command {
 }
 
 func newBenchCommand() *cobra.Command {
-	var bf backendFlags
+	var (
+		bf           backendFlags
+		weightsDecls map[string]string
+		hfCache      string
+	)
 	cmd := &cobra.Command{
 		Use:   "bench",
 		Short: "Probe the backends and print measured TTFT / tok/s per served model",
@@ -394,6 +410,9 @@ func newBenchCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if err := validateWeightsDecls(weightsDecls); err != nil {
+				return err
+			}
 			rt, err := serve.Prepare(ctx, serve.Options{
 				Home:          homeDir,
 				NodeID:        "bench", // display namespace only; bench never connects
@@ -401,6 +420,8 @@ func newBenchCommand() *cobra.Command {
 				Models:        bf.models,
 				Managed:       bf.managed,
 				SkipBench:     true,
+				Weights:       weightsDecls,
+				HFCache:       hfCache,
 				CardsManifest: bf.cardsPath,
 				Log:           log,
 			})
@@ -445,7 +466,23 @@ func newBenchCommand() *cobra.Command {
 		},
 	}
 	bf.register(cmd)
+	cmd.Flags().StringToStringVar(&weightsDecls, "weights", nil,
+		"declare a model's weights identity, raw-or-card-id=<org>/<name>@<40-hex-commit>[+<org>/<name>@<40-hex-commit>:<file>] (repeatable; shown on the card — revisions must be full 40-hex commits)")
+	cmd.Flags().StringVar(&hfCache, "hf-cache", "",
+		"Hugging Face cache root for hf: weights fingerprints (default: $HF_HUB_CACHE, else $HF_HOME/hub, else ~/.cache/huggingface/hub)")
 	return cmd
+}
+
+// validateWeightsDecls rejects a bad --weights spec at startup — a short
+// revision or malformed overlay is an error naming the flag, never a
+// silent skip (§2.2).
+func validateWeightsDecls(decls map[string]string) error {
+	for key, spec := range decls {
+		if _, err := weights.ParseSpec(spec); err != nil {
+			return fmt.Errorf("--weights %s=%q: %w", key, spec, err)
+		}
+	}
+	return nil
 }
 
 func newStatusCommand() *cobra.Command {

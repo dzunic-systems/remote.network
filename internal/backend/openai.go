@@ -21,9 +21,11 @@ import (
 type openaiClient struct {
 	cfg Config
 
-	// /api/tags cache for ProbeMeta sizes (probe.go); lazy, once.
-	tagsOnce sync.Once
-	tags     map[string]int64
+	// /api/tags cache for ProbeMeta sizes and weights digests (probe.go);
+	// lazy, once.
+	tagsOnce   sync.Once
+	tags       map[string]int64
+	tagDigests map[string]string
 
 	// Per-model serving ctx harvested from the last /v1/models listing —
 	// vLLM reports max_model_len (the len it will actually enforce) right
@@ -31,16 +33,21 @@ type openaiClient struct {
 	mu            sync.Mutex
 	modelCtx      map[string]int
 	listed        map[string]bool
-	listTools     map[string]bool   // supported_parameters names "tools" (ds4-server, OpenRouter shape)
-	listReasoning map[string]bool   // …names "reasoning"/"thinking" (OpenRouter vocabulary)
-	rungWorked    map[string]string // request shape → reasoning ladder rung to use (reasoning.go)
-	offThoughts   map[string]int    // request shape → requests in a row that thought through "off"
+	listTools     map[string]bool     // supported_parameters names "tools" (ds4-server, OpenRouter shape)
+	listReasoning map[string]bool     // …names "reasoning"/"thinking" (OpenRouter vocabulary)
+	listRoot      map[string]string   // the listing's root path per model (vLLM: the local snapshot dir — the weights identity)
+	listEfforts   map[string][]string // the listing's reasoning.supported_efforts, lowercased, "none" dropped (TensorFold)
+	rungWorked    map[string]string   // request shape → reasoning ladder rung to use (reasoning.go)
+	offThoughts   map[string]int      // request shape → requests in a row that thought through "off"
 
 	// /props cache (llama.cpp: default_generation_settings.n_ctx), guarded
 	// by mu. Retried until it answers (llama-server 503s while loading),
 	// then kept — llama-server serves a fixed ctx until restart.
 	propsNCtx int
 	propsDone bool
+	// model_path from the same /props: the GGUF file the server loaded —
+	// the weights identity for llama.cpp cards. Empty when unreported.
+	propsModelPath string
 	// chat_template_caps.reasoning_effort_levels from the same /props: known
 	// when the server reports the list.
 	propsLevelsKnown bool
@@ -108,7 +115,8 @@ func (c *openaiClient) loadProps() {
 		DefaultGenerationSettings struct {
 			NCtx int `json:"n_ctx"`
 		} `json:"default_generation_settings"`
-		NCtx             int `json:"n_ctx"`
+		NCtx             int    `json:"n_ctx"`
+		ModelPath        string `json:"model_path"`
 		ChatTemplateCaps struct {
 			Levels *[]string `json:"reasoning_effort_levels"`
 		} `json:"chat_template_caps"`
@@ -122,6 +130,7 @@ func (c *openaiClient) loadProps() {
 	}
 	c.mu.Lock()
 	c.propsNCtx = n
+	c.propsModelPath = props.ModelPath
 	c.propsDone = true
 	if l := props.ChatTemplateCaps.Levels; l != nil {
 		c.propsLevelsKnown, c.propsLevels = true, *l
@@ -132,7 +141,7 @@ func (c *openaiClient) loadProps() {
 type oaModelsResponse struct {
 	Data []struct {
 		ID          string `json:"id"`
-		Root        string `json:"root"`
+		Root        string `json:"root"`          // vLLM: the local dir the weights were loaded from (snapshot paths carry the weights identity)
 		MaxModelLen int    `json:"max_model_len"` // vLLM extension: the context len the server enforces
 		// OpenRouter-shaped listings (ds4-server): context_length is the
 		// allocated --ctx; supported_parameters names "tools" when the
@@ -142,6 +151,13 @@ type oaModelsResponse struct {
 			ContextLength int `json:"context_length"`
 		} `json:"top_provider"`
 		SupportedParameters []string `json:"supported_parameters"`
+		// TensorFold (seen live 16 Nov) states its thinking support right
+		// on the listing: which efforts the model takes. "none" in the
+		// list is not an effort — off is enable_thinking:false.
+		Reasoning *struct {
+			DefaultEnabled   bool     `json:"default_enabled"`
+			SupportedEfforts []string `json:"supported_efforts"`
+		} `json:"reasoning"`
 	} `json:"data"`
 }
 
@@ -169,6 +185,8 @@ func (c *openaiClient) ProbeModels(ctx context.Context) ([]string, error) {
 	listed := make(map[string]bool, len(out.Data))
 	tools := map[string]bool{}
 	reasoning := map[string]bool{}
+	roots := make(map[string]string, len(out.Data))
+	efforts := map[string][]string{}
 	for _, m := range out.Data {
 		ids = append(ids, m.ID)
 		listed[m.ID] = true
@@ -186,12 +204,33 @@ func (c *openaiClient) ProbeModels(ctx context.Context) ([]string, error) {
 				reasoning[m.ID] = true
 			}
 		}
+		if m.Root != "" {
+			roots[m.ID] = m.Root
+		}
+		if r := m.Reasoning; r != nil {
+			var keep []string
+			for _, e := range r.SupportedEfforts {
+				if e = strings.ToLower(strings.TrimSpace(e)); e != "" && e != "none" {
+					keep = append(keep, e)
+				}
+			}
+			if len(keep) > 0 {
+				efforts[m.ID] = keep
+			}
+			// A reasoning object whose only effort is "none" (and that is
+			// off by default) says the model does NOT think.
+			if len(keep) > 0 || r.DefaultEnabled {
+				reasoning[m.ID] = true
+			}
+		}
 	}
 	c.mu.Lock()
 	c.modelCtx = ctxs
 	c.listed = listed
 	c.listTools = tools
 	c.listReasoning = reasoning
+	c.listRoot = roots
+	c.listEfforts = efforts
 	if len(c.nativeOptions) > 0 {
 		c.nativeDone = false // LM Studio: the loaded models may have changed
 	}

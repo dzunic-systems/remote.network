@@ -16,8 +16,9 @@ models:
     ctx: 32768
     aliases: ["qwen3:4b", "qwen3-4b", "Qwen3-4B-Q4_K_M.gguf", "qwen3:4b-instruct"]
     min_vram_mb: 3000
-    suggested_price_in_per_1m: 100000
-    suggested_price_out_per_1m: 300000
+    # 2026-11-17 network price list: not listed anywhere reliable → size band.
+    suggested_price_in_per_1m: 50000
+    suggested_price_out_per_1m: 100000
     gguf:
       repo: Qwen/Qwen3-4B-GGUF
       file: Qwen3-4B-Q4_K_M.gguf
@@ -32,8 +33,8 @@ models:
     ctx: 32768
     aliases: ["qwen3:14b", "qwen3-14b"]
     min_vram_mb: 9000
-    suggested_price_in_per_1m: 200000
-    suggested_price_out_per_1m: 700000
+    suggested_price_in_per_1m: 60000
+    suggested_price_out_per_1m: 120000
 
   - id: qwen/qwen3-30b
     family: qwen3
@@ -43,8 +44,8 @@ models:
     ctx: 32768
     aliases: ["qwen3:30b", "qwen3-30b"]
     min_vram_mb: 18000
-    suggested_price_in_per_1m: 300000
-    suggested_price_out_per_1m: 900000
+    suggested_price_in_per_1m: 60000
+    suggested_price_out_per_1m: 250000
 
   - id: openai/gpt-oss-20b
     family: gpt-oss
@@ -54,8 +55,8 @@ models:
     ctx: 131072
     aliases: ["gpt-oss:20b", "gpt-oss-20b"]
     min_vram_mb: 12000
-    suggested_price_in_per_1m: 150000
-    suggested_price_out_per_1m: 600000
+    suggested_price_in_per_1m: 15000
+    suggested_price_out_per_1m: 65000
 
   - id: google/gemma4-12b-it
     family: gemma4
@@ -65,8 +66,9 @@ models:
     ctx: 131072
     aliases: ["gemma4:12b-it-qat", "gemma4:12b", "gemma-4-12b-it"]
     min_vram_mb: 8000
-    suggested_price_in_per_1m: 100000
-    suggested_price_out_per_1m: 400000
+    # 2026-11-17 network price list: not listed → band, in capped by gemma4-26b.
+    suggested_price_in_per_1m: 45000
+    suggested_price_out_per_1m: 100000
 
   # Dogfood addition 2026-10-01: MoE (4B active) QAT — the sweet spot for
   # 24 GB unified-memory Macs; verified generating on a LAN node.
@@ -78,20 +80,81 @@ models:
     ctx: 131072
     aliases: ["gemma4:26b-a4b-it-qat", "gemma4:26b-a4b", "gemma-4-26b-a4b-it"]
     min_vram_mb: 17000
-    suggested_price_in_per_1m: 200000
-    suggested_price_out_per_1m: 700000
+    suggested_price_in_per_1m: 45000
+    suggested_price_out_per_1m: 150000
+
+  # Dogfood addition 2026-11-16: the DGX Sparks' QAD build (same weights on
+  # both boxes) and the house abliteration overlay. params_b unknown — not
+  # guessed; no gguf pin (TensorFold, not a single GGUF). Prices are half
+  # of OpenRouter's qwen/qwen3.8-flash (HF Qwen/Qwen3.8-Flash-Next,
+  # $0.15/$0.47 on 2026-11-17); the ablit overlay prices as its base.
+  - id: nvidia/qwen3.8-flash-next-fp4
+    family: qwen38
+    display_name: Qwen3.8 Flash Next FP4 (NVIDIA QAD)
+    default_quant: NVFP4
+    ctx: 262144
+    aliases: ["qwen38-flash-next-fp4", "Qwen3.8-Flash-Next-FP4-Local", "nvidia/Qwen3.8-Flash-Next-FP4-Local"]
+    suggested_price_in_per_1m: 75000
+    suggested_price_out_per_1m: 235000
+
+  - id: drowzeys/qwen3.8-flash-next-fp4-ablit
+    family: qwen38
+    display_name: Qwen3.8 Flash Next FP4, abliterated (house-qsa L3-47 overlay)
+    default_quant: NVFP4
+    ctx: 262144
+    aliases: ["qwen38-flash-next-fp4-ablit"]
+    suggested_price_in_per_1m: 75000
+    suggested_price_out_per_1m: 235000
 
 # Default pricing curve: micro-USD per 1M tokens for publisher
 # cards whose operator did not set a price. First row with max_params_b >=
 # the card's params_b wins; params 0 → cheapest row. These are real
 # prices: they figure in every /v1/models entry and every usage.cost, and
-# consumers are billed exactly this. Bands track the market
-# rates of comparable open-weight models on commercial routers; tune here
-# (or per node via --price-in/--price-out) as the operator's price list
-# evolves.
+# consumers are billed exactly this. Policy (2026-11-17): network default
+# price = 50% of market; these bands are the median of the halved
+# network_prices list per size class. The pre-halving rows are kept in
+# code (catalog.LegacyCurvePrice) so the router can still recognize an
+# old node's curve price as "not operator-set". An operator's
+# --price-in/--price-out always wins.
 pricing:
   curve:
-    - {max_params_b: 4, price_in_per_1m: 100000, price_out_per_1m: 300000}
-    - {max_params_b: 8, price_in_per_1m: 120000, price_out_per_1m: 400000}
-    - {max_params_b: 16, price_in_per_1m: 200000, price_out_per_1m: 700000}
-    - {max_params_b: 1000, price_in_per_1m: 300000, price_out_per_1m: 900000}
+    - {max_params_b: 4, price_in_per_1m: 10000, price_out_per_1m: 20000}
+    - {max_params_b: 16, price_in_per_1m: 50000, price_out_per_1m: 100000}
+    - {max_params_b: 1000, price_in_per_1m: 60000, price_out_per_1m: 200000}
+
+# Network price list (2026-11-17): per-model overrides for cards the
+# catalog does not map — match strings are raw backend tags (lower-cased,
+# a trailing :latest is normalized both ways), in/out are micro-USD per
+# 1M, each 50% of the model's market price (source rule in the plan:
+# OpenRouter → provider live API → author API → median → band, then a
+# sibling cap). Applied by the router at card intake to every card whose
+# price is a node default; a card the catalog maps gets its suggested
+# price instead; operator-set prices are never touched. Embedding models
+# are input-only (out 0). source/as_of are documentation.
+network_prices:
+  - {match: ["qwen3.5:9b"], in: 85000, out: 125000, source: "openrouter qwen/qwen3.5-9b 0.17/0.25", as_of: "2026-11-17"}
+  - {match: ["qwen3.5:4b"], in: 50000, out: 100000, source: "band (4.66B)", as_of: "2026-11-17"}
+  - {match: ["qwen3.5:2b", "qwen3.5:0.8b"], in: 10000, out: 20000, source: "band", as_of: "2026-11-17"}
+  - {match: ["qwen3:8b"], in: 55000, out: 120000, source: "median(Alibaba 0.18/0.70, low 0.035/0.138); out capped by qwen3-14b", as_of: "2026-11-17"}
+  - {match: ["qwen3:1.7b"], in: 10000, out: 10000, source: "Together via aggregator 0.02/0.02", as_of: "2026-11-17"}
+  - {match: ["qwen3:0.6b"], in: 10000, out: 10000, source: "band, capped by qwen3:1.7b", as_of: "2026-11-17"}
+  - {match: ["qwen3-coder:30b"], in: 75000, out: 300000, source: "OpenRouter qwen3-coder-30b-a3b 0.15/0.60", as_of: "2026-11-17"}
+  - {match: ["gemma4:e4b-it-qat"], in: 10000, out: 20000, source: "Google API via aggregator 0.02/0.04", as_of: "2026-11-17"}
+  - {match: ["gemma4:e2b-it-qat"], in: 10000, out: 20000, source: "Google API via aggregator 0.02/0.04", as_of: "2026-11-17"}
+  - {match: ["deepseek-r1:8b"], in: 30000, out: 45000, source: "Novita deepseek-r1-0528-qwen3-8b 0.06/0.09", as_of: "2026-11-17"}
+  - {match: ["deepseek-r1:14b"], in: 75000, out: 75000, source: "median of 5 hosts (0.07…1.60) = 0.15", as_of: "2026-11-17"}
+  - {match: ["deepseek-r1:7b"], in: 30000, out: 45000, source: "band, capped by deepseek-r1:8b", as_of: "2026-11-17"}
+  - {match: ["deepseek-r1:1.5b"], in: 10000, out: 20000, source: "band", as_of: "2026-11-17"}
+  - {match: ["glm4:9b"], in: 50000, out: 100000, source: "band", as_of: "2026-11-17"}
+  - {match: ["glm-ocr:bf16"], in: 15000, out: 15000, source: "Z.ai official 0.03/0.03", as_of: "2026-11-17"}
+  - {match: ["olmocr2-32k:latest"], in: 45000, out: 95000, source: "DeepInfra olmOCR-2-7B 0.09/0.19", as_of: "2026-11-17"}
+  - {match: ["deepseek-ocr:3b"], in: 15000, out: 15000, source: "Novita deepseek-ocr-2 (successor, same size) 0.03/0.03", as_of: "2026-11-17"}
+  - {match: ["llama3.2:1b"], in: 13500, out: 100500, source: "OpenRouter 0.027/0.201", as_of: "2026-11-17"}
+  - {match: ["llama3.2:3b"], in: 25450, out: 167500, source: "OpenRouter 0.0509/0.335", as_of: "2026-11-17"}
+  - {match: ["multilingual-e5-large-instruct:latest"], in: 5000, out: 0, source: "DeepInfra 0.01", as_of: "2026-11-17"}
+  - {match: ["qwen3-embedding:8b"], in: 5000, out: 0, source: "OpenRouter 0.01", as_of: "2026-11-17"}
+  - {match: ["qwen3-embedding:4b"], in: 5000, out: 0, source: "OpenRouter 0.02, capped by 8b", as_of: "2026-11-17"}
+  - {match: ["qwen3-embedding:0.6b"], in: 5000, out: 0, source: "DeepInfra 0.01", as_of: "2026-11-17"}
+  - {match: ["nomic-embed-text:latest"], in: 4000, out: 0, source: "Fireworks nomic-embed-text-v1.5 0.008", as_of: "2026-11-17"}
+  - {match: ["nomic-embed-text-v2-moe:latest"], in: 4000, out: 0, source: "sibling of v1.5", as_of: "2026-11-17"}
+  - {match: ["mxbai-embed-large:latest"], in: 5000, out: 0, source: "not listed → embedding band", as_of: "2026-11-17"}

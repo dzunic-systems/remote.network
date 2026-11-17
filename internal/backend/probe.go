@@ -28,6 +28,11 @@ type Meta struct {
 	Ctx          int
 	SizeBytes    int64
 	Capabilities []string // ollama: completion, tools, embedding, vision, …
+	// Efforts is the effort vocabulary the backend stated for the model
+	// (a listing's reasoning object — TensorFold's /v1/models), "none"
+	// already dropped: off is enable_thinking:false, not an effort.
+	// Empty = unknown; probing (--thinking-efforts) fills it elsewhere.
+	Efforts []string
 }
 
 // Prober is implemented by backends that can describe a model's metadata.
@@ -76,12 +81,14 @@ type oaShowResponse struct {
 }
 
 // oaTagsResponse: Ollama's /api/tags — the only public source of on-disk
-// model size. Fetched once per client and cached; tags change rarely
-// mid-process and the whole blob is small.
+// model size, and (since v0.1.4) of the manifest digest, the weights
+// identity for ollama-served cards. Fetched once per client and cached;
+// tags change rarely mid-process and the whole blob is small.
 type oaTagsResponse struct {
 	Models []struct {
-		Name string `json:"name"`
-		Size int64  `json:"size"`
+		Name   string `json:"name"`
+		Size   int64  `json:"size"`
+		Digest string `json:"digest"`
 	} `json:"models"`
 }
 
@@ -97,8 +104,9 @@ func (c *openaiClient) ProbeMeta(ctx context.Context, model string) (Meta, error
 	}
 	c.mu.Lock()
 	n, tools, reasoning := c.modelCtx[model], c.listTools[model], c.listReasoning[model]
+	efforts := c.listEfforts[model]
 	c.mu.Unlock()
-	if n == 0 && !tools && !reasoning {
+	if n == 0 && !tools && !reasoning && len(efforts) == 0 {
 		return Meta{}, err
 	}
 	meta = HeuristicMeta(model)
@@ -114,6 +122,7 @@ func (c *openaiClient) ProbeMeta(ctx context.Context, model string) (Meta, error
 			meta.Capabilities = append(meta.Capabilities, "thinking")
 		}
 	}
+	meta.Efforts = efforts
 	return meta, nil
 }
 
@@ -219,8 +228,23 @@ func (c *openaiClient) ProbeResidency(ctx context.Context) (map[string]int, erro
 	return out, nil
 }
 
-// tagSize lazily fetches and caches /api/tags; misses just return ok=false.
+// tagSize lazily fetches and caches /api/tags (sizes and, for the weights
+// identity, digests); misses just return ok=false.
 func (c *openaiClient) tagSize(ctx context.Context, model string) (int64, bool) {
+	c.fetchTags(ctx)
+	size, ok := c.tags[model]
+	return size, ok
+}
+
+// ollamaDigest returns the manifest digest /api/tags reported for a model
+// ("" when the backend is not Ollama-dialect or names no digest). The
+// weights package normalizes it; this is the raw wire value.
+func (c *openaiClient) ollamaDigest(ctx context.Context, model string) string {
+	c.fetchTags(ctx)
+	return c.tagDigests[model]
+}
+
+func (c *openaiClient) fetchTags(ctx context.Context) {
 	c.tagsOnce.Do(func() {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.cfg.BaseURL+"/api/tags", nil)
 		if err != nil {
@@ -240,13 +264,16 @@ func (c *openaiClient) tagSize(ctx context.Context, model string) (int64, bool) 
 			return
 		}
 		sizes := make(map[string]int64, len(tags.Models))
+		digests := make(map[string]string, len(tags.Models))
 		for _, m := range tags.Models {
 			sizes[m.Name] = m.Size
+			if m.Digest != "" {
+				digests[m.Name] = m.Digest
+			}
 		}
 		c.tags = sizes
+		c.tagDigests = digests
 	})
-	size, ok := c.tags[model]
-	return size, ok
 }
 
 // parseParamSize reads ollama's "26.3B" / "7B" / "0.6B" notation; anything

@@ -185,19 +185,22 @@ func TestPrepareBuildsCards(t *testing.T) {
 	}
 
 	// Catalog-mapped: canonical id, catalog ctx, catalog price (card beats heuristic meta).
-	// Prices are real money: qwen3-4b
-	// tracks the catalog's first-band entry, 100000/300000 micro-USD per 1M.
+	// Prices are real money: qwen3-4b tracks the catalog's entry, 50000/100000
+	// micro-USD per 1M (the 2026-11-17 network price list; node-priced = "default").
 	q := byID["qwen/qwen3-4b"]
 	if q.RawID != "qwen3:4b" || q.Modality != "chat" || q.MaxCtx != 32768 ||
-		q.PriceInPer1M != 100000 || q.PriceOutPer1M != 300000 || q.Family != "qwen3" ||
-		q.ParamsB != 4 || q.DefaultQuant != "Q4_K_M" || q.SizeMB != 2384 || q.BackendID != "ollama" {
+		q.PriceInPer1M != 50000 || q.PriceOutPer1M != 100000 || q.Family != "qwen3" ||
+		q.ParamsB != 4 || q.DefaultQuant != "Q4_K_M" || q.SizeMB != 2384 || q.BackendID != "ollama" ||
+		q.PriceSource != "default" {
 		t.Fatalf("canonical card = %+v", q)
 	}
 
-	// Unmapped: namespaced id, heuristic meta, curve-priced from heuristic params.
+	// Unmapped: namespaced id, heuristic meta, curve-priced from heuristic params
+	// (the 2026-11-17 halved curve: 7B → second band).
 	d := byID[testNodeID+"/deepseek-r1:7b"]
 	if d.RawID != "deepseek-r1:7b" || d.Modality != "chat" || d.Family != "deepseek" ||
-		d.ParamsB != 7 || d.PriceInPer1M != 120000 || d.PriceOutPer1M != 400000 {
+		d.ParamsB != 7 || d.PriceInPer1M != 50000 || d.PriceOutPer1M != 100000 ||
+		d.PriceSource != "default" {
 		t.Fatalf("namespaced card = %+v", d)
 	}
 
@@ -207,7 +210,8 @@ func TestPrepareBuildsCards(t *testing.T) {
 		t.Fatalf("embedding card = %+v", e)
 	}
 
-	// Operator price override beats the catalog.
+	// Operator price override beats the catalog — and rides price_source
+	// "operator" so the router never re-prices it (price_source contract).
 	rt2, err := Prepare(ctx, Options{
 		NodeID:        testNodeID,
 		Backends:      []BackendSpec{{ID: "ollama", Kind: "openai-compatible", URL: rt.Backends[0].URL}},
@@ -221,6 +225,9 @@ func TestPrepareBuildsCards(t *testing.T) {
 	defer rt2.Close()
 	if rt2.Models[0].PriceInPer1M != 99 || rt2.Models[0].PriceOutPer1M != 199 {
 		t.Fatalf("override card prices = %d/%d", rt2.Models[0].PriceInPer1M, rt2.Models[0].PriceOutPer1M)
+	}
+	if rt2.Models[0].PriceSource != "operator" {
+		t.Fatalf("override card price_source = %q, want operator", rt2.Models[0].PriceSource)
 	}
 
 	// --model filter matches raw OR card id, and unknown names error.

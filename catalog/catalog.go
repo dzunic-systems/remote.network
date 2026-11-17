@@ -38,6 +38,18 @@ type Pricing struct {
 	Curve []CurveRow `yaml:"curve"`
 }
 
+// NetworkPrice is one network_prices entry: per-model overrides for raw
+// tags the catalog does not map. Match strings are raw backend tags;
+// in/out are micro-USD per 1M tokens (50% of the model's market price).
+// Source/AsOf are documentation only.
+type NetworkPrice struct {
+	Match  []string `yaml:"match"`
+	In     int      `yaml:"in"`
+	Out    int      `yaml:"out"`
+	Source string   `yaml:"source"`
+	AsOf   string   `yaml:"as_of"`
+}
+
 // Model is one catalog entry.
 type Model struct {
 	ID                     string   `yaml:"id"`
@@ -55,8 +67,9 @@ type Model struct {
 
 // Catalog is the parsed model set.
 type Catalog struct {
-	Models  []Model `yaml:"models"`
-	Pricing Pricing `yaml:"pricing"`
+	Models        []Model        `yaml:"models"`
+	Pricing       Pricing        `yaml:"pricing"`
+	NetworkPrices []NetworkPrice `yaml:"network_prices"`
 }
 
 // Default parses the embedded catalog.
@@ -73,7 +86,30 @@ func Parse(b []byte) (*Catalog, error) {
 	if len(c.Models) == 0 {
 		return nil, fmt.Errorf("catalog: no models")
 	}
+	if err := c.checkNetworkPrices(); err != nil {
+		return nil, err
+	}
 	return &c, nil
+}
+
+// checkNetworkPrices refuses a list where one match string appears twice —
+// a duplicated match would make the charged price depend on list order.
+func (c *Catalog) checkNetworkPrices() error {
+	seen := map[string]bool{}
+	for i := range c.NetworkPrices {
+		np := &c.NetworkPrices[i]
+		for _, m := range np.Match {
+			key := strings.ToLower(strings.TrimSpace(m))
+			if key == "" {
+				return fmt.Errorf("catalog: network_prices entry %d has an empty match", i)
+			}
+			if seen[key] {
+				return fmt.Errorf("catalog: network_prices match %q duplicated (%s)", m, np.Source)
+			}
+			seen[key] = true
+		}
+	}
+	return nil
 }
 
 // ByID looks up a canonical id.
@@ -98,6 +134,79 @@ func (c *Catalog) CurvePrice(paramsB float64) (priceIn, priceOut int) {
 		}
 	}
 	return 0, 0
+}
+
+// NetworkPrice looks a raw backend tag up in the network price list:
+// exact match after lower-casing, also trying with a trailing ":latest"
+// stripped or added (Ollama tags use it inconsistently). Miss → ok=false.
+func (c *Catalog) NetworkPrice(rawTag string) (priceIn, priceOut int, ok bool) {
+	if len(c.NetworkPrices) == 0 {
+		return 0, 0, false
+	}
+	key := strings.ToLower(strings.TrimSpace(rawTag))
+	try := []string{key}
+	if base, has := strings.CutSuffix(key, ":latest"); has {
+		try = append(try, base)
+	} else {
+		try = append(try, key+":latest")
+	}
+	for _, t := range try {
+		for i := range c.NetworkPrices {
+			np := &c.NetworkPrices[i]
+			for _, m := range np.Match {
+				if strings.ToLower(strings.TrimSpace(m)) == t {
+					return np.In, np.Out, true
+				}
+			}
+		}
+	}
+	return 0, 0, false
+}
+
+// legacyCurve is the pricing curve as it stood on 2026-11-17, before the
+// 50%-of-market halving. Nodes released before then bake these rows into
+// their cards; the router uses LegacyCurvePrice to recognize such a price
+// as "node default, not operator-set" and re-price it from the network
+// price list. Delete once every node reports price_source.
+var legacyCurve = []CurveRow{
+	{MaxParamsB: 4, PriceInPer1M: 100000, PriceOutPer1M: 300000},
+	{MaxParamsB: 8, PriceInPer1M: 120000, PriceOutPer1M: 400000},
+	{MaxParamsB: 16, PriceInPer1M: 200000, PriceOutPer1M: 700000},
+	{MaxParamsB: 1000, PriceInPer1M: 300000, PriceOutPer1M: 900000},
+}
+
+// LegacyCurvePrice is CurvePrice over legacyCurve.
+func LegacyCurvePrice(paramsB float64) (priceIn, priceOut int) {
+	for _, row := range legacyCurve {
+		if paramsB <= row.MaxParamsB {
+			return row.PriceInPer1M, row.PriceOutPer1M
+		}
+	}
+	return 0, 0
+}
+
+// legacySuggested holds the catalog suggested prices as they stood before
+// 1d86bdb halved them (and before the 2026-11-17 list re-banded
+// qwen3-4b/gemma4-12b-it): what a pre-halving node prices its
+// catalog-mapped cards with. Same purpose as legacyCurve — recognize an
+// old node's default as not-operator-set. Delete once every node reports
+// price_source.
+var legacySuggested = map[string][2]int{
+	"qwen/qwen3-4b":                         {100000, 300000},
+	"qwen/qwen3-14b":                        {200000, 700000},
+	"qwen/qwen3-30b":                        {300000, 900000},
+	"openai/gpt-oss-20b":                    {150000, 600000},
+	"google/gemma4-12b-it":                  {100000, 400000},
+	"google/gemma4-26b-a4b-it":              {200000, 700000},
+	"nvidia/qwen3.8-flash-next-fp4":         {100000, 300000},
+	"drowzeys/qwen3.8-flash-next-fp4-ablit": {100000, 300000},
+}
+
+// LegacySuggestedPrice returns the pre-1d86bdb suggested price of a
+// catalog id; ok=false for ids with no legacy entry.
+func LegacySuggestedPrice(id string) (priceIn, priceOut int, ok bool) {
+	p, ok := legacySuggested[id]
+	return p[0], p[1], ok
 }
 
 // Resolve maps a user- or backend-supplied id (canonical id, alias, or any

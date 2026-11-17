@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -19,6 +20,7 @@ import (
 	"remote.network/node/internal/bench"
 	"remote.network/node/internal/managed"
 	"remote.network/node/internal/mapping"
+	"remote.network/node/internal/weights"
 	"remote.network/node/wire"
 )
 
@@ -83,6 +85,17 @@ type Options struct {
 	// probing cannot run or the operator knows the recipe.
 	EffortsCapable map[string]string
 
+	// Weights declares a model's weights identity outright (--weights
+	// raw-or-card-id=<org>/<name>@<full-40-hex-commit>
+	// [+<org>/<name>@<commit>:<path>]…, repeatable) — the TensorFold path:
+	// its /v1/models names no files, so only the operator's word can pin
+	// what it loaded. Validated at startup; never guessed here.
+	Weights map[string]string
+	// HFCache overrides the Hugging Face cache root used for hf: lookups
+	// and fingerprints (--hf-cache; default $HF_HUB_CACHE, else
+	// $HF_HOME/hub, else ~/.cache/huggingface/hub).
+	HFCache string
+
 	Log *slog.Logger
 
 	cache *ProbeCache // wired by Prepare from Home; nil = always probe (tests)
@@ -140,6 +153,14 @@ type Runtime struct {
 	cat   *catalog.Catalog
 	m     *mapping.Mapping
 
+	// Weights-identity state (§2.2–§2.4): the resolved HF cache root and
+	// the GGUF digest memo (~/.remote/weights-cache.json). gguf may be nil
+	// only in hand-built test runtimes. pendingWeights parks digests that
+	// landed while the card views were still being assembled.
+	hfCache        string
+	gguf           *weights.GGUFHasher
+	pendingWeights map[string]ggufWeights
+
 	onChange func() // keep-warm state flips → CLI wires SendCapabilityUpdate
 }
 
@@ -177,12 +198,14 @@ func Prepare(ctx context.Context, opts Options) (*Runtime, error) {
 	}
 
 	rt := &Runtime{
-		log:   log,
-		sem:   make(chan struct{}, max(opts.MaxConcurrent, 1)),
-		cache: opts.cache,
-		opts:  opts,
-		cat:   cat,
-		m:     m,
+		log:     log,
+		sem:     make(chan struct{}, max(opts.MaxConcurrent, 1)),
+		cache:   opts.cache,
+		opts:    opts,
+		cat:     cat,
+		m:       m,
+		hfCache: weights.HFCacheRoot(opts.HFCache),
+		gguf:    weights.LoadGGUFHasher(weights.CachePath(opts.Home)),
 	}
 	var pending []BackendSpec
 	for _, spec := range opts.Backends {
@@ -221,6 +244,9 @@ func Prepare(ctx context.Context, opts Options) (*Runtime, error) {
 			rt.Backends[i].Models = filterByIDs(rt.Backends[i].Models, seen)
 		}
 	}
+	// GGUF digests that finished while the card views were being assembled
+	// (a small file hashes in milliseconds) land now — see hashGGUFLater.
+	rt.flushPendingWeights()
 	if len(opts.Models) > 0 && len(rt.Models) == 0 {
 		rt.Close()
 		return nil, fmt.Errorf("requested model(s) %q not served by any backend", opts.Models)
@@ -345,12 +371,24 @@ func (rt *Runtime) materializeCard(ctx context.Context, spec BackendSpec,
 		meta := backend.Meta{
 			Family: cached.Family, Quant: cached.Quant, ParamsB: cached.ParamsB,
 			Ctx: cached.Ctx, SizeBytes: int64(cached.SizeMB) << 20,
-			Capabilities: cached.Capabilities,
+			Capabilities: cached.Capabilities, Efforts: cached.Efforts,
 		}
 		card := buildCard(opts, rt.cat, rt.m, spec, raw, meta, cached.Modality, kind)
 		card.State = cached.State
 		card.TPS = cached.TPS
 		card.TTFTms = cached.TTFTms
+		if card.WeightsID != "" {
+			// An operator declaration (applied in buildCard) wins over the
+			// cached facts; its fingerprint is re-walked, cheap.
+			card.WeightsFingerprint = rt.hfFingerprint(&card)
+		} else {
+			// Never replay a cached identity: the cache key is backend+raw
+			// tag, which survives `ollama pull` of new weights under the
+			// same tag. Every provenance tier is cheap to re-ask (one
+			// /api/tags, the listing already fetched, the GGUF memo keyed
+			// by path+size+mtime), so the card states what is on disk now.
+			rt.applyProvenanceWeights(ctx, client, &card, key)
+		}
 		rt.applyServingCtx(&card, client, raw)
 		rt.applyDetectedCapabilities(ctx, &card, client)
 		log.Info("card cached — skipping probe/bench", "backend", spec.ID, "raw", raw,
@@ -386,13 +424,24 @@ func (rt *Runtime) materializeCard(ctx context.Context, spec BackendSpec,
 	}
 	rt.applyServingCtx(&card, client, raw)
 
+	// Weights identity (§2.2): the operator declaration wins; otherwise
+	// what the backend can prove about its own files, precedence 2–4. The
+	// fingerprint walk is cheap and runs on every (re)probe, no cache;
+	// GGUF hashing never blocks (§2.4).
+	if card.WeightsID != "" {
+		card.WeightsFingerprint = rt.hfFingerprint(&card)
+	} else {
+		rt.applyProvenanceWeights(ctx, client, &card, key)
+	}
+
 	if rt.cache != nil {
 		cached := CachedModel{
 			RawID: raw, Modality: modality, State: card.State,
 			Family: meta.Family, Quant: meta.Quant, ParamsB: meta.ParamsB,
 			Ctx: meta.Ctx, SizeMB: int(meta.SizeBytes >> 20),
-			Capabilities: meta.Capabilities,
-			TPS:          card.TPS, TTFTms: card.TTFTms, ProbedAt: nowStamp(),
+			Capabilities: meta.Capabilities, Efforts: meta.Efforts,
+			WeightsID: card.WeightsID, WeightsFingerprint: card.WeightsFingerprint,
+			TPS: card.TPS, TTFTms: card.TTFTms, ProbedAt: nowStamp(),
 		}
 		if card.State == "ready" && card.TPS > 0 {
 			cached.BenchedAt = nowStamp()
@@ -401,6 +450,166 @@ func (rt *Runtime) materializeCard(ctx context.Context, spec BackendSpec,
 	}
 	rt.applyDetectedCapabilities(ctx, &card, client)
 	return card
+}
+
+// hfFingerprint computes the §2.3 fingerprint for a card that carries an
+// hf: WeightsID. Empty when the snapshot is not on this machine (the
+// expected containerized-backend case) or when a declared overlay file is
+// missing/unreadable — warned once per card, with the path.
+func (rt *Runtime) hfFingerprint(card *ServedModel) string {
+	return weights.Fingerprint(rt.hfCache, card.WeightsID, func(path, reason string) {
+		rt.log.Warn("weights fingerprint incomplete — publishing the id without one",
+			"model", card.ModelID, "path", path, "reason", reason)
+	})
+}
+
+// applyProvenanceWeights fills a card's weights identity from what the
+// backend itself can say about its files, §2.2 precedence 2–4: the Ollama
+// manifest digest, the vLLM root path, the llama.cpp /props model_path.
+// A GGUF file that is readable but not yet hashed publishes without an id
+// and gets one via a capability update once the background hash lands
+// (§2.4) — startup and bench never wait on tens of GB.
+func (rt *Runtime) applyProvenanceWeights(ctx context.Context, client backend.Client, card *ServedModel, cacheKey string) {
+	wp, ok := client.(backend.WeightsProvenance)
+	if !ok {
+		return
+	}
+	digest, root, path := wp.WeightsFacts(ctx, card.RawID)
+
+	// 2. Ollama manifest digest: identity and fingerprint in one.
+	if id, fp, ok := weights.Ollama(digest); ok {
+		card.WeightsID, card.WeightsFingerprint = id, fp
+		return
+	}
+	// 3. A listed root path naming a HF-cache snapshot — any prefix (the
+	// container's /root/.cache/... counts): the rev comes off the path, so
+	// it is exact. A bare org/name resolves through the local refs/main,
+	// and a local dir resolves to nothing at all. Never a guessed rev.
+	if root != "" {
+		if id := weights.HFIDFromPath(root); id != "" {
+			card.WeightsID = id
+			card.WeightsFingerprint = rt.hfFingerprint(card)
+			return
+		}
+		if id := weights.HFIDFromRepo(rt.hfCache, root); id != "" {
+			card.WeightsID = id
+			card.WeightsFingerprint = rt.hfFingerprint(card)
+			return
+		}
+	}
+	// 4. llama.cpp's loaded GGUF. A snapshot path folds back into tier 3;
+	// otherwise the file hashes (memoized; off the startup path).
+	if path != "" {
+		if id := weights.HFIDFromPath(path); id != "" {
+			card.WeightsID = id
+			card.WeightsFingerprint = rt.hfFingerprint(card)
+			return
+		}
+		if hex, ok := rt.gguf.Cached(path); ok {
+			card.WeightsID, card.WeightsFingerprint = "gguf:sha256:"+hex, hex
+			return
+		}
+		if fi, err := os.Stat(path); err == nil && fi.Mode().IsRegular() {
+			rt.hashGGUFLater(card.ModelID, path, cacheKey)
+		}
+	}
+}
+
+// hashGGUFLater digests a GGUF in the background, then moves the id onto
+// the live card (both views) and the probe cache, and fires the change
+// hook the CLI wires to SendCapabilityUpdate. A digest that lands while
+// the card views are still being built (Prepare assembly, a concurrent
+// Refresh) is parked in pendingWeights and applied when the cards exist
+// — never dropped. Lost races beyond that (a refresh dropped the card)
+// just log; the next probe answers from the digest memo instantly.
+func (rt *Runtime) hashGGUFLater(modelID, file, cacheKey string) {
+	rt.log.Info("hashing gguf weights in the background — the card publishes without a weights id until it lands",
+		"model", modelID, "file", file)
+	go func() {
+		hex, err := rt.gguf.HashFile(file)
+		if err != nil {
+			rt.log.Warn("gguf hash failed — the card stays without a weights id",
+				"model", modelID, "file", file, "err", err)
+			return
+		}
+		id, fp := "gguf:sha256:"+hex, hex
+		if rt.setWeights(modelID, id, fp) {
+			rt.changed() // → SendCapabilityUpdate: the router sees the id land
+		} else {
+			// The card views did not exist yet (a tiny file hashing while
+			// Prepare was still assembling) — park it for the flush.
+			rt.mu.Lock()
+			if rt.pendingWeights == nil {
+				rt.pendingWeights = map[string]ggufWeights{}
+			}
+			rt.pendingWeights[modelID] = ggufWeights{id: id, fp: fp}
+			rt.mu.Unlock()
+		}
+		if rt.cache != nil {
+			if c, ok := rt.cache.Get(cacheKey); ok {
+				c.WeightsID, c.WeightsFingerprint = id, fp
+				rt.cache.Put(cacheKey, c)
+			}
+		}
+		rt.log.Info("gguf weights hashed — capability update carries the id",
+			"model", modelID, "sha256", hex)
+	}()
+}
+
+// ggufWeights is one background digest waiting for its card to exist.
+type ggufWeights struct{ id, fp string }
+
+// flushPendingWeights applies parked digests and clears them; reports
+// whether any landed so the caller counts it as a card change. Must
+// never run under rt.mu — it fires changed(), which reads the cards.
+func (rt *Runtime) flushPendingWeights() bool {
+	rt.mu.Lock()
+	applied := rt.flushPendingWeightsLocked()
+	rt.mu.Unlock()
+	if applied {
+		rt.changed()
+	}
+	return applied
+}
+
+func (rt *Runtime) flushPendingWeightsLocked() bool {
+	applied := false
+	for modelID, u := range rt.pendingWeights {
+		if rt.setWeightsLocked(modelID, u.id, u.fp) {
+			applied = true
+		}
+		delete(rt.pendingWeights, modelID)
+	}
+	return applied
+}
+
+// setWeights moves a weights identity onto every view of one card, under
+// the same lock Refresh uses. Returns whether anything changed.
+func (rt *Runtime) setWeights(modelID, id, fp string) bool {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	return rt.setWeightsLocked(modelID, id, fp)
+}
+
+func (rt *Runtime) setWeightsLocked(modelID, id, fp string) bool {
+	changed := false
+	for i := range rt.Models {
+		if rt.Models[i].ModelID == modelID &&
+			(rt.Models[i].WeightsID != id || rt.Models[i].WeightsFingerprint != fp) {
+			rt.Models[i].WeightsID, rt.Models[i].WeightsFingerprint = id, fp
+			changed = true
+		}
+	}
+	for bi := range rt.Backends {
+		for i := range rt.Backends[bi].Models {
+			if rt.Backends[bi].Models[i].ModelID == modelID &&
+				(rt.Backends[bi].Models[i].WeightsID != id || rt.Backends[bi].Models[i].WeightsFingerprint != fp) {
+				rt.Backends[bi].Models[i].WeightsID, rt.Backends[bi].Models[i].WeightsFingerprint = id, fp
+				changed = true
+			}
+		}
+	}
+	return changed
 }
 
 // applyDetectedCapabilities folds probe-confirmed capability facts into a
@@ -476,7 +685,17 @@ func (rt *Runtime) Refresh(ctx context.Context) bool {
 		return false
 	}
 	rt.mu.Lock()
-	defer rt.mu.Unlock()
+	changed := rt.refreshLocked(ctx)
+	rt.mu.Unlock()
+	// GGUF digests that finished while the write lock was held (a small
+	// file hashing mid-refresh) land now, outside the lock — changed()
+	// reads the cards. They are a card change worth re-advertising even
+	// when the re-list saw none.
+	return rt.flushPendingWeights() || changed
+}
+
+// refreshLocked is Refresh's body; rt.mu is held for writing.
+func (rt *Runtime) refreshLocked(ctx context.Context) bool {
 	changed := false
 	for bi := range rt.Backends {
 		e := &rt.Backends[bi]
@@ -599,6 +818,12 @@ func buildCard(opts Options, cat *catalog.Catalog, m *mapping.Mapping, spec Back
 	if strings.Contains(strings.ToLower(meta.Family), "ocr") || strings.Contains(strings.ToLower(raw), "ocr") {
 		card.Specialty = "ocr"
 	}
+	// An effort vocabulary stated by the listing itself (TensorFold's
+	// reasoning object) lands on the card without a pin — the operator's
+	// --thinking-efforts still wins, applied just below.
+	if len(card.ReasoningEfforts) == 0 && len(meta.Efforts) > 0 {
+		card.ReasoningEfforts = meta.Efforts
+	}
 	if mapped {
 		card.ModelID = mod.ID
 		card.MaxCtx = mod.Ctx
@@ -626,9 +851,40 @@ func buildCard(opts Options, cat *catalog.Catalog, m *mapping.Mapping, spec Back
 	if card.PriceInPer1M == 0 && card.PriceOutPer1M == 0 && !mapped {
 		card.PriceInPer1M, card.PriceOutPer1M = cat.CurvePrice(card.ParamsB)
 	}
+	// Who set the price: an operator override
+	// beats every network default; anything the node priced itself is
+	// "default" and the router may re-price it from the network list.
+	if opts.PriceInPer1M != 0 || opts.PriceOutPer1M != 0 {
+		card.PriceSource = "operator"
+	} else {
+		card.PriceSource = "default"
+	}
 	applyManifest(&card, opts.Manifest, raw, card.ModelID)
 	opts.applyCapabilityPins(&card, raw)
+	// The operator's --weights declaration (§2.2 precedence 1) pins the id
+	// outright, by raw id or card id like the capability pins; the
+	// fingerprint (when the snapshot is local) is the caller's job, at
+	// materialize time. Startup validated the spec — a bad one here cannot
+	// happen via the CLI, and an unusable value simply leaves the field to
+	// the provenance tiers.
+	if decl := opts.weightsDecl(raw, card.ModelID); decl != "" {
+		if spec, err := weights.ParseSpec(decl); err == nil {
+			card.WeightsID = spec.ID()
+		}
+	}
 	return card
+}
+
+// weightsDecl returns the operator's --weights spec for a card ("" =
+// none), matched by raw id or card id — the same lookup the capability
+// pins use.
+func (opts Options) weightsDecl(raw, modelID string) string {
+	for _, key := range []string{raw, modelID} {
+		if v, ok := opts.Weights[key]; ok && strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
 }
 
 // applyCapabilityPins forces operator-pinned capabilities on a card, by raw
@@ -784,6 +1040,12 @@ func prepareManaged(ctx context.Context, opts Options, m *mapping.Mapping, log *
 	}
 	if opts.PriceOutPer1M != 0 {
 		card.PriceOutPer1M = opts.PriceOutPer1M
+	}
+	// Same price_source contract as buildCard (see buildCard).
+	if opts.PriceInPer1M != 0 || opts.PriceOutPer1M != 0 {
+		card.PriceSource = "operator"
+	} else {
+		card.PriceSource = "default"
 	}
 	if !opts.SkipBench {
 		// The cache applies here too: a benched managed model skips the

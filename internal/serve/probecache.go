@@ -27,6 +27,17 @@ type CachedModel struct {
 	Ctx          int      `json:"ctx,omitempty"`
 	SizeMB       int      `json:"size_mb,omitempty"`
 	Capabilities []string `json:"capabilities,omitempty"` // needed on the cache path too — tools/vision flags otherwise vanish on restart (pre-2026-10 cache files just lack it)
+	// Efforts is the effort vocabulary the listing reported (TensorFold's
+	// reasoning object; §2.5) — carried so a cached card keeps it without
+	// a pin.
+	Efforts []string `json:"efforts,omitempty"`
+
+	// Weights identity (§2.4), recorded for inspection only: a cache hit
+	// re-derives it from the backend every time (materializeCard) — a tag
+	// re-pulled under the same name must not keep publishing the old
+	// digest. The GGUF cost is carried by weights-cache.json instead.
+	WeightsID          string `json:"weights_id,omitempty"`
+	WeightsFingerprint string `json:"weights_fingerprint,omitempty"`
 
 	// Bench facts (zero when skipped/failed).
 	TPS       float64 `json:"tps,omitempty"`

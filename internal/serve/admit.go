@@ -82,13 +82,17 @@ func (rt *Runtime) admitPending(ctx context.Context) bool {
 		changed = true
 		rt.log.Info("backend came up — admitted", "backend", spec.ID, "models", len(entry.Models))
 	}
-	if changed {
+	// A parked GGUF digest (its hash finishing while the entry appended
+	// under the lock) counts as a change too — the flush fires changed()
+	// itself when it applied anything.
+	flushed := rt.flushPendingWeights()
+	if changed || flushed {
 		if rt.cache != nil {
 			rt.cache.Save()
 		}
 		rt.changed()
 	}
-	return changed
+	return changed || flushed
 }
 
 // dropPendingLocked removes one spec from the retry list (no-op when the
