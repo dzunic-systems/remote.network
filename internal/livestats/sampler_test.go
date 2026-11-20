@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"runtime"
 	"testing"
 	"time"
 
@@ -71,12 +72,14 @@ func TestSamplerRound(t *testing.T) {
 		t.Fatalf("dead backend must stay agent-sourced with nil metrics: %+v", dead)
 	}
 
-	// live.json exists, is 0600, and carries the connection line.
+	// live.json exists, is 0600 (Unix only: Windows has no permission
+	// bits and reports every writable file as 0666), and carries the
+	// connection line.
 	info, err := os.Stat(home + "/live.json")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0o600 {
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 		t.Fatalf("live.json mode = %v", info.Mode().Perm())
 	}
 	doc := struct {

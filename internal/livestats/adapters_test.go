@@ -122,21 +122,24 @@ func TestTensorFoldGolden(t *testing.T) {
 		t.Fatalf("running/waiting = %v/%v", run, wait)
 	}
 	if kv == nil || *kv < 0.38 || *kv > 0.39 {
-		t.Fatalf("kv = %v, want the pool ratio ~0.3826", kv)
+		t.Fatalf("kv = %v, want the pool ratio ~0.3826 (one stream, slots unknown)", kv)
 	}
 	// 86813219726 bytes / 1048576 = 82791 MB.
 	if mem == nil || *mem != 82791 {
 		t.Fatalf("mem_used_mb = %v, want 82791 (memory.active bytes → MB)", mem)
 	}
-	// kv max over pools: a second pool reading higher wins.
+	// Each pool is one active stream's fill of ITS OWN window; the node's
+	// KV use is their sum over the slots. Two streams (0.3826 + 0.7712) on
+	// a ten-slot engine are 11.5% of it, not the 77% the longer one reads.
 	withPools := tensorfoldGolden + `tensorfold:kv_cache_usage_ratio{pool="1"} 0.7712
 `
 	srv2 := serveBody(t, withPools, "", 200)
 	a2 := newAdapter("tf2", "tensorfold", srv2.URL)
+	a2.slots = 10
 	a2.dialectOf(context.Background())
 	_, _, kv2, _, _, _ := a2.readTensorFold(context.Background())
-	if kv2 == nil || *kv2 < 0.77 {
-		t.Fatalf("kv max over pools = %v, want 0.7712", kv2)
+	if kv2 == nil || *kv2 < 0.115 || *kv2 > 0.116 {
+		t.Fatalf("kv = %v, want (0.382629+0.7712)/10 = 0.1154", kv2)
 	}
 }
 

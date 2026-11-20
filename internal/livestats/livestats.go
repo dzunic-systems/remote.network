@@ -151,6 +151,7 @@ func (s *Sampler) round(ctx context.Context) {
 			Models: b.Models, Slots: b.Slots, Held: b.Held, Busy1m: b.Busy1m,
 		}
 		if adapter := s.adapterFor(b); adapter != nil {
+			adapter.slots = b.Slots
 			runCtx, cancel := context.WithTimeout(ctx, probeWait)
 			running, waiting, kv, tps, prefix, mem := adapter.read(runCtx)
 			cancel()

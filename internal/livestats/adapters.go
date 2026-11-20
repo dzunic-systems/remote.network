@@ -39,6 +39,9 @@ type adapterState struct {
 	id   string
 	kind string
 	base string // base URL without /v1
+	// slots is the backend's slot count (the agent's max concurrent),
+	// set by the sampler before each read; 0 = unknown.
+	slots int
 
 	client *http.Client
 
@@ -151,7 +154,13 @@ func (a *adapterState) rate(now time.Time, cur, last float64) (float64, bool) {
 // readTensorFold is the verified GB10/TensorFold 1.1.4 reader:
 //
 //	tensorfold:requests_running / requests_waiting — running, waiting
-//	tensorfold:kv_cache_usage_ratio{pool="…"} — kv, max over pools
+//	tensorfold:kv_cache_usage_ratio{pool="…"} — kv: the SUM over pools
+//	  divided by the slot count. Each pool is one ACTIVE stream's tokens
+//	  over that stream's own context window (an idle engine lists one
+//	  pool at 0, ten running list ten), and TensorFold admits by slot, not
+//	  by a shared cache. The max over pools, read until 21 Nov, made one
+//	  long prompt (0.6 of its window) read as a 60%-full node with nine of
+//	  ten slots free. Measured on GB10 21 Nov under 10 direct requests.
 //	tensorfold:generation_tokens_total delta — decode_tps
 //	tensorfold:prompt_tokens_cached_total / prompt_tokens_total deltas — prefix_hit
 //	/health memory.active (BYTES) — mem_used_mb
@@ -163,7 +172,7 @@ func (a *adapterState) readTensorFold(ctx context.Context) (running, waiting *in
 	}
 	var gen, pmt, cache float64
 	sawGen := false
-	kvMax := -1.0
+	kvSum, kvStreams := 0.0, 0
 	for _, s := range parsePromText(body) {
 		switch s.Name {
 		case "tensorfold:requests_running":
@@ -173,9 +182,8 @@ func (a *adapterState) readTensorFold(ctx context.Context) (running, waiting *in
 			v := int(s.Value)
 			waiting = &v
 		case "tensorfold:kv_cache_usage_ratio":
-			if s.Value > kvMax {
-				kvMax = s.Value // max over pool labels
-			}
+			kvSum += s.Value
+			kvStreams++
 		case "tensorfold:generation_tokens_total":
 			gen, sawGen = s.Value, true
 		case "tensorfold:prompt_tokens_total":
@@ -184,8 +192,10 @@ func (a *adapterState) readTensorFold(ctx context.Context) (running, waiting *in
 			cache = s.Value
 		}
 	}
-	if kvMax >= 0 {
-		v := clamp01(kvMax)
+	if kvStreams > 0 {
+		// Unknown slots: the listed streams are the only denominator there
+		// is (an over-statement while some slots are idle, never an under-).
+		v := clamp01(kvSum / float64(max(a.slots, kvStreams)))
 		kv = &v
 	}
 	if sawGen {
