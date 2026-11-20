@@ -19,6 +19,7 @@ import (
 	"remote.network/node/catalog"
 	"remote.network/node/internal/backend"
 	"remote.network/node/internal/bench"
+	"remote.network/node/internal/livestats"
 	"remote.network/node/internal/managed"
 	"remote.network/node/internal/mapping"
 	"remote.network/node/internal/weights"
@@ -118,7 +119,10 @@ type BackendSpec struct {
 type ServedModel = wire.ServedModel
 
 // BackendEntry is one live backend with its cards and its own admission
-// slots — concurrency is per endpoint, not per node.
+// slots — concurrency is per endpoint, not per node. The busy ring
+// counts ErrBusy refusals so the stats object can
+// report them per backend: capacity pressure the agent itself saw. It
+// lives behind a pointer — entries are copied into rt.Backends.
 type BackendEntry struct {
 	ID       string
 	Kind     string
@@ -127,6 +131,39 @@ type BackendEntry struct {
 	Models   []ServedModel
 	restrict []string // per-backend raw-id restriction from the spec
 	sem      chan struct{}
+
+	busy *busyRing
+}
+
+// busyRing is the 60-second ErrBusy window.
+type busyRing struct {
+	mu sync.Mutex
+	at []time.Time
+}
+
+func (r *busyRing) note(now time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.at = append(r.at, now)
+	if len(r.at) > 256 { // hard cap; count prunes normally
+		r.at = r.at[len(r.at)-256:]
+	}
+}
+
+// count returns refusals in the last minute, pruning as it goes.
+func (r *busyRing) count(now time.Time) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	keep := r.at[:0]
+	n := 0
+	for _, at := range r.at {
+		if now.Sub(at) < time.Minute {
+			keep = append(keep, at)
+			n++
+		}
+	}
+	r.at = keep
+	return n
 }
 
 // Runtime is the prepared serving stack. Hold it for the process lifetime.
@@ -316,6 +353,7 @@ func (rt *Runtime) prepareBackend(ctx context.Context, spec BackendSpec) (*Backe
 		Models:   []ServedModel{},
 		restrict: spec.Models,
 		sem:      make(chan struct{}, max(opts.MaxConcurrent, 1)),
+		busy:     &busyRing{},
 	}
 	restrict := setOf(spec.Models)
 	global := setOf(opts.Models)
@@ -1099,7 +1137,7 @@ func prepareManaged(ctx context.Context, opts Options, m *mapping.Mapping, log *
 	}
 	rt.Backends = []BackendEntry{{
 		ID: "managed", Kind: rt.BackendKind, URL: rt.BackendURL,
-		Client: client, Models: []ServedModel{card}, sem: rt.sem,
+		Client: client, Models: []ServedModel{card}, sem: rt.sem, busy: &busyRing{},
 	}}
 	rt.Models = []ServedModel{card}
 	return rt, nil
@@ -1184,6 +1222,9 @@ func (rt *Runtime) HandleInference(ctx context.Context, req wire.InferenceReques
 	case rt.semFor(entry) <- struct{}{}:
 		defer func() { <-rt.semFor(entry) }()
 	default:
+		if entry != nil && entry.busy != nil {
+			entry.busy.note(time.Now()) // N4: report the refusal per backend
+		}
 		return wire.InferenceDoneData{}, wire.ErrBusy
 	}
 
@@ -1285,6 +1326,9 @@ func (rt *Runtime) HandleEmbed(ctx context.Context, req wire.EmbedRequestData) (
 	case rt.semFor(entry) <- struct{}{}:
 		defer func() { <-rt.semFor(entry) }()
 	default:
+		if entry != nil && entry.busy != nil {
+			entry.busy.note(time.Now()) // N4: report the refusal per backend
+		}
 		return wire.EmbedDoneData{}, wire.ErrBusy
 	}
 
@@ -1304,6 +1348,37 @@ func (rt *Runtime) ServingModelIDs() []string {
 		ids = append(ids, m.ModelID)
 	}
 	return ids
+}
+
+// LiveBackends is the sampler's per-backend view:
+// the agent's own truth — slot capacity, held slots, ErrBusy refusals in
+// the last minute, and the node-side ids each backend serves. The legacy
+// single-backend runtime (hand-built test runtimes) reports nothing: its
+// sem is not per backend.
+func (rt *Runtime) LiveBackends() []livestats.BackendLive {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	if len(rt.Backends) == 0 {
+		return nil
+	}
+	now := time.Now()
+	out := make([]livestats.BackendLive, 0, len(rt.Backends))
+	for i := range rt.Backends {
+		e := &rt.Backends[i]
+		models := make([]string, 0, len(e.Models))
+		for _, m := range e.Models {
+			models = append(models, m.ModelID)
+		}
+		busy := 0
+		if e.busy != nil {
+			busy = e.busy.count(now)
+		}
+		out = append(out, livestats.BackendLive{
+			ID: e.ID, Kind: e.Kind, URL: e.URL,
+			Models: models, Slots: cap(e.sem), Held: len(e.sem), Busy1m: busy,
+		})
+	}
+	return out
 }
 
 // Close stops the managed server (BYO backends are not ours to stop).

@@ -8,105 +8,27 @@
 package weights
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"remote.network/node/weightsid"
 )
 
-// repoRev matches one "<org>/<name>@<rev40>" reference.
-var repoRev = regexp.MustCompile(`^([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)@([0-9a-fA-F]{40})$`)
+// The identity grammar lives in the exported weightsid package (the
+// router verifies identities with the same rules); these aliases keep the
+// node-side call sites unchanged.
+type (
+	Spec    = weightsid.Spec
+	Overlay = weightsid.Overlay
+)
 
-// pathCharset is what an overlay path may contain (the router's intake
-// regex agrees: [A-Za-z0-9._/-]+).
-var overlayPath = regexp.MustCompile(`^[A-Za-z0-9._/-]+$`)
+// ParseSpec parses an operator --weights declaration (weightsid.ParseSpec).
+func ParseSpec(s string) (Spec, error) { return weightsid.ParseSpec(s) }
 
-// Spec is a parsed operator declaration: one base repo at a full commit,
-// plus optional file-level overlays (house ablations ride stock weights).
-type Spec struct {
-	Repo     string // "<org>/<name>"
-	Rev      string // 40-hex commit, lowercased
-	Overlays []Overlay
-}
-
-// Overlay is one file taken from another repo at a pinned commit.
-type Overlay struct {
-	Repo string
-	Rev  string
-	Path string // within that repo, "/"-separated, no leading slash
-}
-
-// ParseSpec parses "<org>/<name>@<rev40>[+<org>/<name>@<rev40>:<path>]...".
-// Revisions must be full 40-hex commits — a short or branch-name revision
-// is an error, never silently accepted or guessed (uppercased hex is
-// lowercased). The caller's error path names the flag; the message here
-// says which rule failed.
-func ParseSpec(s string) (Spec, error) {
-	var spec Spec
-	parts := strings.Split(s, "+")
-	ref := strings.TrimSpace(parts[0])
-	m := repoRev.FindStringSubmatch(ref)
-	if m == nil {
-		return spec, fmt.Errorf("want <org>/<name>@<full-40-hex-commit>, got %q", ref)
-	}
-	spec.Repo, spec.Rev = m[1]+"/"+m[2], strings.ToLower(m[3])
-	for _, p := range parts[1:] {
-		refPart, path, _ := strings.Cut(strings.TrimSpace(p), ":")
-		ov := Overlay{Path: strings.Trim(path, "/")}
-		m := repoRev.FindStringSubmatch(refPart)
-		if m == nil {
-			return spec, fmt.Errorf("overlay want <org>/<name>@<full-40-hex-commit>:<path>, got %q", p)
-		}
-		ov.Repo, ov.Rev = m[1]+"/"+m[2], strings.ToLower(m[3])
-		if ov.Path == "" || !overlayPath.MatchString(ov.Path) || hasDotDot(ov.Path) {
-			return spec, fmt.Errorf("overlay path %q: want a repo file path (letters, digits, . _ / -)", path)
-		}
-		spec.Overlays = append(spec.Overlays, ov)
-	}
-	return spec, nil
-}
-
-func hasDotDot(path string) bool {
-	for seg := range strings.SplitSeq(path, "/") {
-		if seg == ".." {
-			return true
-		}
-	}
-	return false
-}
-
-// ID renders the canonical WeightsID: "hf:<org>/<name>@<rev>" plus one
-// "+<org>/<name>@<rev>:<path>" per overlay.
-func (s Spec) ID() string {
-	var b strings.Builder
-	b.WriteString("hf:")
-	b.WriteString(s.Repo)
-	b.WriteString("@")
-	b.WriteString(s.Rev)
-	for _, ov := range s.Overlays {
-		b.WriteString("+")
-		b.WriteString(ov.Repo)
-		b.WriteString("@")
-		b.WriteString(ov.Rev)
-		b.WriteString(":")
-		b.WriteString(ov.Path)
-	}
-	return b.String()
-}
-
-// ParseID reads a rendered "hf:" id back into its spec; other schemes (and
-// malformed ids) are not-ok. Fingerprint uses it to find what to hash.
-func ParseID(id string) (Spec, bool) {
-	if !strings.HasPrefix(id, "hf:") {
-		return Spec{}, false
-	}
-	spec, err := ParseSpec(strings.TrimPrefix(id, "hf:"))
-	if err != nil {
-		return Spec{}, false
-	}
-	return spec, true
-}
+// ParseID reads a rendered "hf:" id back into its spec (weightsid.ParseID).
+func ParseID(id string) (Spec, bool) { return weightsid.ParseID(id) }
 
 // HFCacheRoot resolves the Hugging Face cache root: the --hf-cache flag
 // first, then the env vars huggingface_hub itself honours, then the
@@ -166,8 +88,7 @@ func HFIDFromPath(path string) string {
 func HFIDFromRepo(cacheRoot, repo string) string {
 	org, name, ok := strings.Cut(repo, "/")
 	if !ok || org == "" || name == "" || strings.ContainsAny(repo, "\\") ||
-		!overlayPath.MatchString(org) || !overlayPath.MatchString(name) ||
-		hasDotDot(repo) {
+		!weightsid.SafePath(org) || !weightsid.SafePath(name) || strings.Contains(name, "/") {
 		return ""
 	}
 	b, err := os.ReadFile(filepath.Join(cacheRoot, "models--"+org+"--"+name, "refs", "main"))
@@ -188,18 +109,8 @@ func HFIDFromRepo(cacheRoot, repo string) string {
 func Ollama(digest string) (id, fp string, ok bool) {
 	d := strings.ToLower(strings.TrimSpace(digest))
 	d = strings.TrimPrefix(d, "sha256:")
-	if len(d) != 64 || !isHex64(d) {
+	if !weightsid.IsHex64(d) {
 		return "", "", false
 	}
 	return "ollama:sha256:" + d, d, true
-}
-
-func isHex64(s string) bool {
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
-			return false
-		}
-	}
-	return true
 }

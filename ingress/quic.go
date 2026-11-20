@@ -298,8 +298,8 @@ func (c *Client) serveQUICEmbed(sctx context.Context, stream *quic.Stream, env w
 		_ = stream.Close()
 		return
 	}
-	c.inFlight.Add(1)
-	defer c.inFlight.Add(-1)
+	c.acquireInflight()
+	defer c.releaseInflight()
 	done, err := eh.HandleEmbed(sctx, req)
 	if err != nil {
 		code := "backend_error"

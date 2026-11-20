@@ -82,6 +82,11 @@ Ollama on another machine in your network (start it there with
 remote node start … --backend-url http://gpu-box.local:11434/v1
 ```
 
+Ollama has no metrics endpoint (`/metrics` is 404), so the load view
+reads `/api/ps`: how much memory the loaded models hold, and what the
+agent itself reports (slots held, busy refusals). Running/waiting/KV
+stay unknown — Ollama does not expose them.
+
 ## vLLM
 
 ```sh
@@ -100,6 +105,13 @@ launched with `--enable-auto-tool-choice` (and `--vision-capable`,
 `--thinking-capable` for multimodal and reasoning models). SGLang is set
 up the same way, on its own port (default 30000).
 
+For the live load view, vLLM wants `--enable-metrics`-style exposition on
+`/metrics` (SGLang: `--enable-metrics`). The agent reads
+`vllm:num_requests_running` / `num_requests_waiting` and the KV usage
+ratio from there — and, until a real body has verified that parsing,
+it keeps those fields unknown rather than guess: the machine line in
+`remote node top` still shows slots/held/busy, which every backend has.
+
 ## llama.cpp (`llama-server`)
 
 ```sh
@@ -115,6 +127,13 @@ remote node start … --backend-url http://localhost:8081/v1 \
 pass `--tool-capable` with the model id `llama-server` lists at
 `http://localhost:8081/v1/models`. The agent reads the window from
 `/props`. (8081, because llama-server's default 8080 is a popular port.)
+
+Add `--metrics` and the agent reads the live load straight from
+llama-server: running (`llamacpp:requests_processing`), deferred
+(`llamacpp:requests_deferred`), and tokens/second from the counter
+deltas. Builds without a KV usage ratio simply leave KV out of the
+view. `remote node top --watch 2s` is the quickest way to watch a
+request move through.
 
 ## LM Studio
 

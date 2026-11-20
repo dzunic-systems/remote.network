@@ -192,8 +192,10 @@ func TestVLLMRootWeightsID(t *testing.T) {
 // TestGGUFWeightsBackground: a llama.cpp card whose model_path names a
 // readable GGUF publishes without a weights id first, then gets
 // gguf:sha256:… when the background hash lands (with a capability update
-// via the OnChange hook), memoized in ~/.remote/weights-cache.json and in
-// the probe cache — a restart carries the id with no re-hash.
+// via the OnChange hook), memoized in ~/.remote/weights-cache.json — a
+// restart re-derives the id from that memo with no re-hash. (The probe
+// cache's copy is informational since 2ba76b3 and may miss a hash that
+// lands before the entry is written — the Windows CI ordering.)
 func TestGGUFWeightsBackground(t *testing.T) {
 	home := t.TempDir()
 	gguf := filepath.Join(home, "qwen3-8b-q4_k_m.gguf")
@@ -257,9 +259,9 @@ func TestGGUFWeightsBackground(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	// The probe cache carries it for the restart.
-	if c, ok := rt.cache.Get("llama|local-model"); !ok || c.WeightsID != want {
-		t.Fatalf("probe cache = %+v (ok %v), want weights id %q", c, ok, want)
+	// The digest memo carries it for the restart.
+	if hx, ok := rt.gguf.Cached(gguf); !ok || "gguf:sha256:"+hx != want {
+		t.Fatalf("digest memo = %q (ok %v), want %q", hx, ok, want)
 	}
 
 	// A second digest hashes strictly after setup — the direct background
@@ -292,8 +294,8 @@ func TestGGUFWeightsBackground(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("no capability update fired when the hash landed")
 	}
-	if c, _ := rt.cache.Get("llama|local-model"); c.WeightsID != want2 {
-		t.Fatalf("probe cache not updated with the new digest: %+v", c)
+	if hx, ok := rt.gguf.Cached(gguf2); !ok || "gguf:sha256:"+hx != want2 {
+		t.Fatalf("digest memo missing the new file: %q (ok %v)", hx, ok)
 	}
 	rt.Close()
 

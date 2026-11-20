@@ -10,7 +10,9 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -21,6 +23,7 @@ import (
 	"remote.network/node/internal/backends"
 	"remote.network/node/internal/bench"
 	"remote.network/node/internal/hardware"
+	"remote.network/node/internal/livestats"
 	"remote.network/node/internal/schedule"
 	"remote.network/node/internal/serve"
 	"remote.network/node/internal/weights"
@@ -97,7 +100,7 @@ func newNodeCommand() *cobra.Command {
 		Short: "Node agent lifecycle",
 	}
 
-	node.AddCommand(newStartCommand(), newBenchCommand(), newStatusCommand())
+	node.AddCommand(newStartCommand(), newBenchCommand(), newStatusCommand(), newTopCommand())
 	return node
 }
 
@@ -222,7 +225,29 @@ func newStartCommand() *cobra.Command {
 				handler = scheduledHandler{servingHandler: rt, gate: gate}
 			}
 
-			fleet := ingress.NewFleet(ingress.FleetConfig{
+			// The NODE-wide dispatch counter: one
+			// counter behind every router client, so each spine's heartbeat
+			// reports what all of them are sending — no spine dispatches
+			// into a node another spine already filled without seeing it.
+			nodeInFlight := &atomic.Int64{}
+			// The live sampler: one goroutine for the whole agent,
+			// started after the first successful backend probe (Prepare
+			// returned), stopped when drain cancels runCtx. It publishes
+			// the newest reading for the heartbeats and writes live.json
+			// for `remote node top`.
+			var fleet *ingress.Fleet
+			sampler := livestats.New(func() []livestats.BackendLive {
+				return rt.LiveBackends()
+			}, filepath.Join(homeDir, "live.json"),
+				func() []livestats.ConnState {
+					states := fleet.ConnStates()
+					out := make([]livestats.ConnState, len(states))
+					for i, c := range states {
+						out[i] = livestats.ConnState{Name: c.Name, Connected: c.Connected, InFlightConn: c.InFlightConn}
+					}
+					return out
+				}, log)
+			fleet = ingress.NewFleet(ingress.FleetConfig{
 				Seeds:  routerURLs,
 				Strict: routerStrict,
 				Base: ingress.Config{
@@ -233,6 +258,8 @@ func newStartCommand() *cobra.Command {
 					RouterKey:    routerKey,
 					RouterRoot:   routerRoot,
 					NodeToken:    nodeToken,
+					NodeInFlight: nodeInFlight,
+					Stats:        sampler.Latest,
 					Log:          log,
 					OnReprobe: func(all bool, models []string) bool {
 						return rt.ForceReprobe(runCtx, all, models)
@@ -262,6 +289,8 @@ func newStartCommand() *cobra.Command {
 			// must also move the heartbeat's serving list.
 			rt.OnChange(func() { gate.advertise() })
 			go rt.Warm(runCtx)
+
+			go sampler.Run(runCtx)
 
 			// Residency refresh: what the backend actually has in memory
 			// (Ollama /api/ps) and the context window it is truly serving

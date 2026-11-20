@@ -150,10 +150,94 @@ type AuthFailData struct {
 }
 
 // HeartbeatData is the node's liveness + load report (5s default).
+//
+// InFlight counts DISPATCHES the agent holds. Since v0.1.6 it is
+// node-wide — every router's traffic to this node — and
+// InFlightConn carries this connection's own share, InFlightScope saying
+// so. Older agents send no scope: their InFlight counted this connection
+// only, which is exactly what InFlightScopeConn names (the counter
+// used to live on the per-router client, so a two-spine node reported
+// each spine only its own load and no spine saw the others').
+//
+// Stats, when present, is the sampler's newest machine + backend reading.
+// Every field is optional and pointers mean unknown ≠ 0: a
+// backend that does not expose running/waiting/KV leaves them out, never
+// 0. Routers clamp the object and drop it whole when it breaks bounds —
+// the heartbeat itself always counts.
 type HeartbeatData struct {
-	InFlight      int      `json:"in_flight"`
-	ServingModels []string `json:"serving_models,omitempty"`
+	InFlight      int        `json:"in_flight"`
+	InFlightConn  int        `json:"in_flight_conn,omitempty"` // this connection's dispatches (scope node)
+	InFlightScope string     `json:"in_flight_scope,omitempty"`
+	ServingModels []string   `json:"serving_models,omitempty"`
+	Stats         *NodeStats `json:"stats,omitempty"`
 }
+
+// NodeStats is one 5-second sample of the machine and its backends.
+// At is the sample time (RFC3339).
+type NodeStats struct {
+	At       string         `json:"at"`
+	CPU      *CPUStats      `json:"cpu,omitempty"`
+	Mem      *MemStats      `json:"mem,omitempty"`
+	GPUs     []GPUStats     `json:"gpus,omitempty"`
+	Backends []BackendStats `json:"backends,omitempty"`
+}
+
+// CPUStats is the machine's CPU: the 1-minute load average, logical
+// cores, and — where the platform can measure it — utilization 0..1
+// (nil on platforms that cannot, never 0-when-unknown).
+type CPUStats struct {
+	Load1 float64  `json:"load1"`
+	Cores int      `json:"cores"`
+	Util  *float64 `json:"util,omitempty"`
+}
+
+// MemStats is the machine's memory in MB.
+type MemStats struct {
+	TotalMB     int64 `json:"total_mb"`
+	UsedMB      int64 `json:"used_mb"`
+	AvailableMB int64 `json:"available_mb"`
+}
+
+// GPUStats is one accelerator's live reading; util and memories are nil
+// when the platform cannot measure them (GB10's unified memory reports
+// no GPU memory figure — `[N/A]` from nvidia-smi becomes nil).
+type GPUStats struct {
+	Index      int      `json:"index"`
+	Util       *float64 `json:"util,omitempty"` // 0..1
+	MemUsedMB  *int64   `json:"mem_used_mb,omitempty"`
+	MemTotalMB *int64   `json:"mem_total_mb,omitempty"`
+	PowerW     *float64 `json:"power_w,omitempty"`
+	TempC      *float64 `json:"temp_c,omitempty"`
+}
+
+// BackendStats is one configured backend's live reading. Source says
+// where the numbers came from: "metrics" (the backend's own Prometheus
+// endpoint), "api" (an admin endpoint, e.g. Ollama /api/ps), or "agent"
+// (the agent's own semaphore — held/slots/busy are always known, the
+// backend's internal counts are not). Models are the node-side ids this
+// backend serves.
+type BackendStats struct {
+	ID        string   `json:"id"`
+	Kind      string   `json:"kind"` // tensorfold|vllm|sglang|llamacpp|ollama|agent|openai-compatible|…
+	Source    string   `json:"source"`
+	Models    []string `json:"models"`
+	Slots     int      `json:"slots"`                 // the agent's admission slots for this backend
+	Held      int      `json:"held"`                  // slots currently held
+	Busy1m    int      `json:"busy_1m"`               // ErrBusy refusals in the last minute
+	Running   *int     `json:"running,omitempty"`     // the backend's own running count
+	Waiting   *int     `json:"waiting,omitempty"`     // queued inside the backend
+	KV        *float64 `json:"kv,omitempty"`          // KV-cache use 0..1
+	DecodeTPS *float64 `json:"decode_tps,omitempty"`  // token-counter delta
+	PrefixHit *float64 `json:"prefix_hit,omitempty"`  // cached/prompt tokens over the interval
+	MemUsedMB *int64   `json:"mem_used_mb,omitempty"` // what the backend says it holds
+}
+
+// In-flight scope of HeartbeatData.InFlight. A router that sees no scope
+// treats the count as connection-scoped (old agent).
+const (
+	InFlightScopeNode = "node"
+	InFlightScopeConn = "conn"
+)
 
 // CapabilityUpdateData refreshes hardware/backend info without a reconnect.
 type CapabilityUpdateData struct {
@@ -286,9 +370,13 @@ type InferenceChunkData struct {
 }
 
 // InferenceDoneData is the node's own token accounting, sent once per
-// request — the router cross-checks it against its counts; the router's
-// output count stays authoritative (a node cannot under-report its way to
-// unearned earnings; a node cannot over-bill either).
+// request. The router bills the node's OutputTokens only when the stream it
+// relayed could have produced them: no fewer than the chunks that carried
+// output, no more than the bytes they spelled (unless the request asked for
+// reasoning, which a backend may bill without streaming). Outside those
+// bounds it bills its own estimate and records an honesty disagreement. A
+// node therefore cannot over-bill past what it delivered, and an honest
+// speculative decoder (several tokens a chunk) is billed what it generated.
 type InferenceDoneData struct {
 	InputTokens  int `json:"input_tokens"`
 	OutputTokens int `json:"output_tokens"`

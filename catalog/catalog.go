@@ -8,9 +8,12 @@ import (
 	_ "embed"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 
 	"gopkg.in/yaml.v3"
+
+	"remote.network/node/weightsid"
 )
 
 //go:embed models.yaml
@@ -63,6 +66,10 @@ type Model struct {
 	SuggestedPriceInPer1M  int      `yaml:"suggested_price_in_per_1m"`  // micro-USD
 	SuggestedPriceOutPer1M int      `yaml:"suggested_price_out_per_1m"` // micro-USD
 	GGUF                   *GGUF    `yaml:"gguf,omitempty"`
+	// WeightsFingerprints pins the exact weights this id stands for: when
+	// set, a card maps to this id only if its weights_fingerprint is in the
+	// list (64-hex each, validated at load). Empty = name trust, as before.
+	WeightsFingerprints []string `yaml:"weights_fingerprints"`
 }
 
 // Catalog is the parsed model set.
@@ -89,6 +96,13 @@ func Parse(b []byte) (*Catalog, error) {
 	if err := c.checkNetworkPrices(); err != nil {
 		return nil, err
 	}
+	for _, m := range c.Models {
+		for _, fp := range m.WeightsFingerprints {
+			if !weightsid.IsHex64(fp) {
+				return nil, fmt.Errorf("catalog: %s: weights_fingerprints entry %q is not 64 lowercase hex", m.ID, fp)
+			}
+		}
+	}
 	return &c, nil
 }
 
@@ -110,6 +124,16 @@ func (c *Catalog) checkNetworkPrices() error {
 		}
 	}
 	return nil
+}
+
+// PinsAllow reports whether a card with this fingerprint may carry the
+// model's id: always when the model pins nothing, else only for a listed
+// fingerprint (an empty fingerprint never matches a pin).
+func (m *Model) PinsAllow(fingerprint string) bool {
+	if len(m.WeightsFingerprints) == 0 {
+		return true
+	}
+	return slices.Contains(m.WeightsFingerprints, fingerprint) && fingerprint != ""
 }
 
 // ByID looks up a canonical id.

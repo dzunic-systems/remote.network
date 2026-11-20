@@ -18,8 +18,8 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"sort"
-	"strings"
+
+	"remote.network/node/weightsid"
 )
 
 // hashBuf bounds one file read; LFS blobs are never read, so this covers
@@ -64,13 +64,7 @@ func Fingerprint(cacheRoot, id string, warn func(path, reason string)) string {
 		lines = append(lines, ls...)
 	}
 
-	sort.Strings(lines)
-	h := sha256.New()
-	for _, l := range lines {
-		h.Write([]byte(l))
-		h.Write([]byte("\n"))
-	}
-	return hex.EncodeToString(h.Sum(nil))
+	return weightsid.FingerprintLines(lines)
 }
 
 // snapshotLines walks one snapshot: for the base it hashes every content
@@ -86,7 +80,7 @@ func snapshotLines(cacheRoot, repo, rev, only string, fail func(path, reason str
 		// containerized-backend case: quiet empty. An overlay snapshot that
 		// is not here means the declared weights cannot be verified: warn.
 		if only != "" {
-			fail("overlay:"+repo+"/"+only, ReasonMissing)
+			fail(weightsid.OverlayPath(repo, only), ReasonMissing)
 		}
 		return nil, false
 	}
@@ -97,10 +91,10 @@ func snapshotLines(cacheRoot, repo, rev, only string, fail func(path, reason str
 		path := filepath.Join(root, rel)
 		hex, err := fileHash(path)
 		if err != nil {
-			fail("overlay:"+repo+"/"+only, reasonFor(err))
+			fail(weightsid.OverlayPath(repo, only), reasonFor(err))
 			return nil, false
 		}
-		return []string{"overlay:" + repo + "/" + only + "\t" + hex}, true
+		return []string{weightsid.Line(weightsid.OverlayPath(repo, only), hex)}, true
 	}
 
 	var lines []string
@@ -112,7 +106,7 @@ func snapshotLines(cacheRoot, repo, rev, only string, fail func(path, reason str
 		if d.IsDir() {
 			return nil
 		}
-		if excludedName(d.Name()) {
+		if weightsid.ExcludedName(d.Name()) {
 			return nil
 		}
 		rel, err := filepath.Rel(root, path)
@@ -125,7 +119,7 @@ func snapshotLines(cacheRoot, repo, rev, only string, fail func(path, reason str
 			fail(filepath.ToSlash(rel), reasonFor(err))
 			return errFingerprint
 		}
-		lines = append(lines, filepath.ToSlash(rel)+"\t"+hex)
+		lines = append(lines, weightsid.Line(filepath.ToSlash(rel), hex))
 		return nil
 	})
 	if err != nil {
@@ -174,7 +168,7 @@ func fileHash(path string) (string, error) {
 	} else if !fi.Mode().IsRegular() {
 		return "", errors.New(ReasonIrregular)
 	}
-	if base := filepath.Base(blob); len(base) == 64 && isHex64(base) {
+	if base := filepath.Base(blob); weightsid.IsHex64(base) {
 		return base, nil // LFS: the blob name is the digest
 	}
 	f, err := os.Open(blob)
@@ -187,23 +181,4 @@ func fileHash(path string) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
-}
-
-// excludedName reports whether a file is pure metadata, excluded from the
-// fingerprint (case-insensitive). Everything else counts — weights,
-// tokenizer, chat template, configs.
-func excludedName(name string) bool {
-	l := strings.ToLower(name)
-	switch {
-	case strings.HasPrefix(l, "readme"), strings.HasPrefix(l, "license"), strings.HasPrefix(l, "notice"):
-		return true
-	case l == ".gitattributes":
-		return true
-	}
-	for _, ext := range []string{".md", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".pdf"} {
-		if strings.HasSuffix(l, ext) {
-			return true
-		}
-	}
-	return false
 }

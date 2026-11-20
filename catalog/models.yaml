@@ -94,6 +94,8 @@ models:
     default_quant: NVFP4
     ctx: 262144
     aliases: ["qwen38-flash-next-fp4", "Qwen3.8-Flash-Next-FP4-Local", "nvidia/Qwen3.8-Flash-Next-FP4-Local"]
+    # nvidia/Qwen3.8-Flash-Next-FP4-Local@b9ce18a6…, rebuilt from Hugging Face 2026-11-17.
+    weights_fingerprints: ["e1d7fc58e4a0636e0720dbb020927578f61c763c0a111bf63cdae64bd03935ee"]
     suggested_price_in_per_1m: 75000
     suggested_price_out_per_1m: 235000
 
@@ -103,6 +105,8 @@ models:
     default_quant: NVFP4
     ctx: 262144
     aliases: ["qwen38-flash-next-fp4-ablit"]
+    # stock + house-qsa L3-47 overlay @c44f5b92…; both Sparks report it (2026-11-17).
+    weights_fingerprints: ["faa104f8093404f343314d450c0be154f92df985b813718249211d5d74c0317a"]
     suggested_price_in_per_1m: 75000
     suggested_price_out_per_1m: 235000
 

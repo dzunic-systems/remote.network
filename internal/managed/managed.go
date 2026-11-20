@@ -205,6 +205,10 @@ func (s *Server) launch() error {
 		"--port", fmt.Sprint(s.cfg.Port),
 		"-c", fmt.Sprint(s.cfg.Ctx),
 		"--no-webui",
+		// /metrics feeds the live stats adapter:
+		// running, deferred and KV use for this backend. Off by default
+		// in llama-server.
+		"--metrics",
 	}
 	cmd := exec.Command(s.cfg.Binary, args...)
 	// Crash output goes to a file — discarding it once cost a blind

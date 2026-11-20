@@ -302,3 +302,15 @@ func (f *Fleet) Clients() map[string]*Client {
 	}
 	return out
 }
+
+// ConnStates snapshots every attached client's connection line for
+// live.json.
+func (f *Fleet) ConnStates() []ConnState {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]ConnState, 0, len(f.clients))
+	for _, a := range f.clients {
+		out = append(out, a.client.ConnectionState())
+	}
+	return out
+}

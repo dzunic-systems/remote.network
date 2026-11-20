@@ -147,7 +147,13 @@ The service scripts pass these on: `service.sh install -- --serve-hours
 22:00-07:00"` on Windows.
 
 `remote node status` prints this node's id, its router pin and the last
-known state. `remote node start --help` lists every flag; the ones you are
+known state. `remote node top` shows what the running agent sees right
+now — CPU/GPU/memory, per-backend running/waiting/KV, output speed, and
+each router connection's in-flight count — read from the agent's own
+5-second sample (`~/.remote/live.json`, written only while it runs; older
+than 15 s the answer is "agent not running"). `--watch 2s` refreshes,
+`--json` prints the raw sample. No listener, no new port.
+`remote node start --help` lists every flag; the ones you are
 likely to need are in [docs/backends.md](docs/backends.md#flag-reference).
 
 Run **one** agent per identity: two copies sharing `~/.remote` fight over

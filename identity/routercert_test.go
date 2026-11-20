@@ -70,14 +70,14 @@ func TestRouterCert(t *testing.T) {
 
 	// Router id does not match the certified key.
 	mismatched, _ := SignRouterCert(rootPriv, routerPub, time.Now().Add(time.Hour), 1)
-	mismatched.RouterID = ID(routerPub)[:25] + "x"
+	mismatched.RouterID = flipLast(ID(routerPub))
 	if _, _, err := VerifyRouterCert(mismatched); err == nil {
 		t.Fatal("id/key mismatch verified")
 	}
 
 	// RootID disagrees with RootKey (the two must always agree).
 	badRoot := cert
-	badRoot.RootID = ID(rootPub)[:25] + "x"
+	badRoot.RootID = flipLast(ID(rootPub))
 	if _, _, err := VerifyRouterCert(badRoot); err == nil {
 		t.Fatal("root_id/root_key mismatch verified")
 	}
@@ -106,4 +106,16 @@ func TestRouterCertRotation(t *testing.T) {
 		t.Fatal("rotated key chained to a different root")
 	}
 	var _ ed25519.PublicKey = oldRoot
+}
+
+// flipLast returns id with its last character changed — always to a
+// different one. Appending a fixed "x" left the id unchanged whenever it
+// already ended in x (1 run in 32), and the mismatch then "verified".
+func flipLast(id string) string {
+	last := id[len(id)-1]
+	repl := byte('a')
+	if last == 'a' {
+		repl = 'b'
+	}
+	return id[:len(id)-1] + string(repl)
 }

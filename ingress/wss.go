@@ -99,6 +99,17 @@ type Config struct {
 	// outbound QUIC connection to the router's public endpoint that gives
 	// symmetric-NAT nodes a direct plane without any hole punching.
 	NoReverseQUIC bool
+
+	// NodeInFlight is the NODE-wide dispatch counter, shared by every
+	// client of the fleet. The caller owns it —
+	// set it once where the Fleet is built and the pointer reaches every
+	// client through the shared Base config. Nil (legacy callers, tests):
+	// the client counts only itself and heartbeats scope "conn".
+	NodeInFlight *atomic.Int64
+
+	// Stats is the sampler's newest machine + backend reading, attached to every heartbeat. Nil = heartbeats carry
+	// no stats object (the pre-v0.1.6 wire shape).
+	Stats func() *wire.NodeStats
 }
 
 // Client maintains the control channel with reconnect + backoff.
@@ -461,8 +472,8 @@ func (c *Client) serveEmbed(ctx context.Context, conn *websocket.Conn, nodeID, r
 		return
 	}
 
-	c.inFlight.Add(1)
-	defer c.inFlight.Add(-1)
+	c.acquireInflight()
+	defer c.releaseInflight()
 	done, err := eh.HandleEmbed(ictx, req)
 	if err != nil {
 		code := "backend_error"
@@ -529,8 +540,8 @@ func (c *Client) runHandler(ctx context.Context, reqID string, req wire.Inferenc
 	if c.cfg.Handler == nil {
 		return wire.InferenceDoneData{}, "no_handler", errors.New("node agent has no serving backend")
 	}
-	c.inFlight.Add(1)
-	defer c.inFlight.Add(-1)
+	c.acquireInflight()
+	defer c.releaseInflight()
 
 	done, err = c.cfg.Handler.HandleInference(ctx, req, emit)
 	if err != nil {
@@ -564,10 +575,50 @@ func (c *Client) heartbeatLoop(ctx context.Context, conn *websocket.Conn, nodeID
 }
 
 func (c *Client) sendHeartbeat(conn *websocket.Conn, nodeID string) error {
-	return c.send(conn, wire.TypeNodeHeartbeat, nodeID, wire.HeartbeatData{
-		InFlight:      int(c.inFlight.Load()),
-		ServingModels: c.currentServing(),
-	})
+	return c.send(conn, wire.TypeNodeHeartbeat, nodeID, c.heartbeatData())
+}
+
+// heartbeatData is the load report one client sends. in_flight is the
+// NODE-wide dispatch count when the shared counter is wired: every router's traffic, so any spine's scheduler sees the
+// load the others are creating (the scheduler's load() assumes it).
+// in_flight_conn keeps this session's own share for the per-spine split,
+// and scope names what in_flight counts. Without the shared counter the
+// count is this connection's own and says so (the pre-v0.1.6 shape, made
+// explicit).
+func (c *Client) heartbeatData() wire.HeartbeatData {
+	connN := int(c.inFlight.Load())
+	hb := wire.HeartbeatData{ServingModels: c.currentServing()}
+	if c.cfg.NodeInFlight != nil {
+		hb.InFlight = int(c.cfg.NodeInFlight.Load())
+		hb.InFlightConn = connN
+		hb.InFlightScope = wire.InFlightScopeNode
+	} else {
+		hb.InFlight = connN
+		hb.InFlightScope = wire.InFlightScopeConn
+	}
+	if c.cfg.Stats != nil {
+		hb.Stats = c.cfg.Stats()
+	}
+	return hb
+}
+
+// acquireInflight counts one request against this client's connection and
+// the node-wide counter. Every dispatch site (WSS inference, WSS embed,
+// direct-QUIC embed; runHandler serves both inference planes) goes through
+// these two, so Drain can keep waiting on the connection's own count
+// while heartbeats report the node total.
+func (c *Client) acquireInflight() {
+	c.inFlight.Add(1)
+	if c.cfg.NodeInFlight != nil {
+		c.cfg.NodeInFlight.Add(1)
+	}
+}
+
+func (c *Client) releaseInflight() {
+	c.inFlight.Add(-1)
+	if c.cfg.NodeInFlight != nil {
+		c.cfg.NodeInFlight.Add(-1)
+	}
 }
 
 // checkPin enforces router identity: explicit flag pin > persisted TOFU pin.
@@ -842,6 +893,30 @@ func (c *Client) Drain(ctx context.Context, deadline time.Duration) {
 // currentNodeID derives the identity id (cached key math is cheap).
 func (c *Client) currentNodeID() string {
 	return identity.ID(c.cfg.Identity.Public().(ed25519.PublicKey))
+}
+
+// ConnState is one router connection's live.json line: which spine,
+// whether it is up, and this connection's own
+// dispatch count.
+type ConnState struct {
+	Name         string `json:"name"`
+	Connected    bool   `json:"connected"`
+	InFlightConn int    `json:"in_flight_conn"`
+}
+
+// ConnectionState snapshots this client's line. Name is the router id
+// once a handshake proved it, else the connect URL (the file's reader
+// shows whichever exists — the node top view is the owner's, and these
+// are their own spines).
+func (c *Client) ConnectionState() ConnState {
+	state := ConnState{Name: c.cfg.RouterURL, InFlightConn: int(c.inFlight.Load())}
+	if id := c.RouterID(); id != "" {
+		state.Name = id
+	}
+	c.sendMu.Lock()
+	state.Connected = c.curConn != nil
+	c.sendMu.Unlock()
+	return state
 }
 
 // sendRaw writes a bare envelope without req correlation. sendReq0 does

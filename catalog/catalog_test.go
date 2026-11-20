@@ -174,3 +174,32 @@ func TestNetworkPriceOllamaNamespace(t *testing.T) {
 		t.Fatal("a bare namespace must not match")
 	}
 }
+
+// TestWeightsPins: the two Spark entries pin their fingerprints; PinsAllow
+// admits exactly those; unpinned entries admit anything (name trust); a
+// malformed pin fails the load.
+func TestWeightsPins(t *testing.T) {
+	c, err := Default()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stock, ablit := c.ByID("nvidia/qwen3.8-flash-next-fp4"), c.ByID("drowzeys/qwen3.8-flash-next-fp4-ablit")
+	if stock == nil || ablit == nil {
+		t.Fatal("spark entries missing")
+	}
+	const fs, fa = "e1d7fc58e4a0636e0720dbb020927578f61c763c0a111bf63cdae64bd03935ee",
+		"faa104f8093404f343314d450c0be154f92df985b813718249211d5d74c0317a"
+	if !stock.PinsAllow(fs) || stock.PinsAllow(fa) || stock.PinsAllow("") {
+		t.Fatal("stock pin wrong")
+	}
+	if !ablit.PinsAllow(fa) || ablit.PinsAllow(fs) {
+		t.Fatal("ablit pin wrong")
+	}
+	if q := c.ByID("qwen/qwen3-4b"); q == nil || !q.PinsAllow("") || !q.PinsAllow(fs) {
+		t.Fatal("unpinned entry must admit any fingerprint")
+	}
+	bad := []byte("models:\n  - id: a/b\n    weights_fingerprints: [\"XYZ\"]\n")
+	if _, err := Parse(bad); err == nil {
+		t.Fatal("malformed pin accepted")
+	}
+}
