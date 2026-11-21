@@ -171,6 +171,35 @@ func TestOllamaGolden(t *testing.T) {
 	}
 }
 
+// The fleet's Ollama nodes are registered openai-compatible (their /v1 is):
+// /metrics 404 plus an /api/ps answer is Ollama, whatever the kind says. A
+// generic server with no /api/ps stays agent-sourced.
+func TestOllamaBehindTheGenericKind(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	})
+	mux.HandleFunc("/api/ps", func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte(ollamaPS))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	a := newAdapter("default", "openai-compatible", srv.URL+"/v1")
+	if got := a.dialectOf(context.Background()); got != "ollama" {
+		t.Fatalf("dialect = %q, want ollama (/metrics 404, /api/ps answers)", got)
+	}
+	if _, _, _, _, _, mem := a.read(context.Background()); mem == nil || *mem != 892 {
+		t.Fatalf("mem_used_mb = %v, want 892", mem)
+	}
+
+	plain := httptest.NewServer(http.NotFoundHandler())
+	t.Cleanup(plain.Close)
+	b := newAdapter("default", "openai-compatible", plain.URL+"/v1")
+	if got := b.dialectOf(context.Background()); got != "" {
+		t.Fatalf("a server with neither /metrics nor /api/ps detected as %q", got)
+	}
+}
+
 // §8 N3: a dialect the adapters do not speak (vllm — shipped disabled)
 // falls back to agent-sourced stats: the read returns nothing, the
 // sampler keeps held/slots/busy.

@@ -98,6 +98,14 @@ func (a *adapterState) dialectOf(ctx context.Context) string {
 	}
 	body, err := a.fetch(ctx, "/metrics")
 	if err != nil {
+		// Ollama behind the generic kind: every Ollama node of the fleet is
+		// registered openai-compatible (its /v1 is), and its /metrics is
+		// 404. Until 21 Nov that left all four on agent counts only; the
+		// /api/ps answer is what says Ollama.
+		if a.isOllama(ctx) {
+			a.dialect, a.detectAt, a.failures = "ollama", time.Now(), 0
+			return a.dialect
+		}
 		a.failures++
 		return a.dialect // keep the last detection until it fails hard
 	}
@@ -115,6 +123,21 @@ func (a *adapterState) dialectOf(ctx context.Context) string {
 		}
 	}
 	return a.dialect
+}
+
+// isOllama reports whether the backend answers Ollama's /api/ps: a JSON
+// object carrying a "models" list (empty when nothing is loaded).
+func (a *adapterState) isOllama(ctx context.Context) bool {
+	body, err := a.fetch(ctx, "/api/ps")
+	if err != nil {
+		return false
+	}
+	var ps map[string]json.RawMessage
+	if json.Unmarshal([]byte(body), &ps) != nil {
+		return false
+	}
+	m, ok := ps["models"]
+	return ok && len(m) > 0 && m[0] == '['
 }
 
 func (a *adapterState) fetch(ctx context.Context, path string) (string, error) {
