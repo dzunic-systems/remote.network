@@ -309,20 +309,25 @@ func (a *adapterState) readOllama(ctx context.Context) (running, waiting *int, k
 	if err != nil {
 		return nil, nil, nil, nil, nil, nil
 	}
+	// size is what a loaded model holds, in RAM or VRAM; size_vram only
+	// its GPU part. On a CPU-only machine size_vram is 0 (21 Nov, .17:
+	// four models loaded, size_vram 0 on each), and summing it reported
+	// nothing at all. Apple Silicon reports size_vram == size.
 	var ps struct {
 		Models []struct {
+			Size     int64 `json:"size"`
 			SizeVRAM int64 `json:"size_vram"`
 		} `json:"models"`
 	}
 	if json.Unmarshal([]byte(body), &ps) != nil {
 		return nil, nil, nil, nil, nil, nil
 	}
-	var vram int64
+	var held int64
 	for _, m := range ps.Models {
-		vram += m.SizeVRAM
+		held += max(m.Size, m.SizeVRAM)
 	}
-	if vram > 0 {
-		v := vram / 1048576
+	if held > 0 {
+		v := held / 1048576
 		memUsedMB = &v
 	}
 	return nil, nil, nil, nil, nil, memUsedMB

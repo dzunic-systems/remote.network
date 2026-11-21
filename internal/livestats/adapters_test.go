@@ -192,6 +192,20 @@ func TestOllamaBehindTheGenericKind(t *testing.T) {
 		t.Fatalf("mem_used_mb = %v, want 892", mem)
 	}
 
+	// A CPU-only machine: size_vram 0, the model held in RAM (size).
+	cpu := http.NewServeMux()
+	cpu.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) })
+	cpu.HandleFunc("/api/ps", func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte(`{"models":[{"name":"gemma3:1b","size":992686897,"size_vram":0},{"name":"qwen3:1.7b","size":2989332888,"size_vram":0}]}`))
+	})
+	cpuSrv := httptest.NewServer(cpu)
+	t.Cleanup(cpuSrv.Close)
+	c := newAdapter("default", "openai-compatible", cpuSrv.URL+"/v1")
+	// (992686897 + 2989332888) / 1048576 = 3797 MB.
+	if _, _, _, _, _, mem := c.read(context.Background()); mem == nil || *mem != 3797 {
+		t.Fatalf("CPU-only mem_used_mb = %v, want 3797 (size, not size_vram 0)", mem)
+	}
+
 	plain := httptest.NewServer(http.NotFoundHandler())
 	t.Cleanup(plain.Close)
 	b := newAdapter("default", "openai-compatible", plain.URL+"/v1")
