@@ -108,3 +108,22 @@ func TestSamplerRound(t *testing.T) {
 		t.Fatalf("temp file survived: %v", err)
 	}
 }
+
+// An Ollama backend registered openai-compatible (every Ollama node of the
+// fleet, 21 Nov) is labelled "api", its reading's real source, not
+// "metrics".
+func TestSamplerLabelsOllamaBehindTheGenericKind(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) })
+	mux.HandleFunc("/api/ps", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte(ollamaPS)) })
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	s := New(func() []BackendLive {
+		return []BackendLive{{ID: "default", Kind: "openai-compatible", URL: srv.URL + "/v1", Slots: 1}}
+	}, t.TempDir()+"/live.json", nil, nil)
+	s.round(context.Background())
+	b := s.Latest().Backends[0]
+	if b.Source != "api" || b.MemUsedMB == nil || *b.MemUsedMB != 892 {
+		t.Fatalf("source %q mem %v, want api / 892", b.Source, b.MemUsedMB)
+	}
+}

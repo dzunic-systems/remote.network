@@ -3,6 +3,7 @@ package backend
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -340,7 +341,7 @@ func TestOpenAICarriesStructuredOutputAndKnobs(t *testing.T) {
 		ResponseFormat: &wire.ResponseFormat{Type: "json_schema", JSONSchema: &wire.JSONSchemaSpec{
 			Name: "a", Strict: true, Schema: json.RawMessage(`{"type":"object"}`),
 		}},
-		Temperature: 0.2,
+		Temperature: ptrFloat(0.2),
 		Priority:    10,
 	}
 	if err := oc.StreamChat(context.Background(), req, func(Delta) error { return nil }); err != nil {
@@ -370,5 +371,115 @@ func TestOpenAICarriesStructuredOutputAndKnobs(t *testing.T) {
 		if _, present := got[k]; present {
 			t.Fatalf("unset %s leaked upstream", k)
 		}
+	}
+
+	// A stated 0 is greedy and is sent as 0, not dropped as unset (until 22
+	// Nov `r.Temperature > 0` dropped it and the backend sampled at 1.0).
+	got = nil
+	if err := oc.StreamChat(context.Background(), ChatRequest{
+		Model: "m", Messages: []ChatMessage{{Role: "user", Content: "hi"}}, Temperature: ptrFloat(0),
+	}, func(Delta) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if v, present := got["temperature"]; !present || v != float64(0) {
+		t.Fatalf("temperature 0 reached the backend as %v (present %v), want 0", v, present)
+	}
+}
+
+func ptrFloat(f float64) *float64 { return &f }
+
+// Anthropic takes temperature 0..1, 0 included, and none with thinking on
+// (any value but 1 is a 400 then): a stated 0 rides without thinking and is
+// dropped with it. Negative control: the old `> 0` rule drops the 0.
+func TestAnthropicTemperatureZeroRidesWithoutThinking(t *testing.T) {
+	var got map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = nil
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+	}))
+	t.Cleanup(srv.Close)
+	c, err := New(Config{Name: "a", Kind: KindAnthropic, BaseURL: srv.URL, APIKey: "k"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	send := func(reasoning *wire.ReasoningControl) {
+		t.Helper()
+		_ = c.StreamChat(context.Background(), ChatRequest{Model: "m", MaxTokens: 100,
+			Messages: []ChatMessage{{Role: "user", Content: "hi"}}, Temperature: ptrFloat(0), Reasoning: reasoning}, func(Delta) error { return nil })
+		if got == nil {
+			t.Fatal("no request reached the fake")
+		}
+	}
+	send(nil)
+	if v, present := got["temperature"]; !present || v != float64(0) {
+		t.Errorf("temperature 0 without thinking reached Anthropic as %v (present %v), want 0", v, present)
+	}
+	send(&wire.ReasoningControl{Effort: "high", MaxTokens: 2048})
+	if v, present := got["temperature"]; present {
+		t.Errorf("temperature %v rode with thinking on, which Anthropic refuses", v)
+	}
+}
+
+// The OpenAI usage tail's detail blocks ride into the uniform Usage:
+// prompt_tokens_details.cached_tokens and
+// completion_tokens_details.reasoning_tokens. A server that omits them
+// (most OpenAI-compatible backends) reports 0 = unreported.
+func TestOpenAIUsageDetailTokens(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(`data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}` + "\n\n"))
+		_, _ = w.Write([]byte(`data: {"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":8,` +
+			`"prompt_tokens_details":{"cached_tokens":7},"completion_tokens_details":{"reasoning_tokens":5}}}` + "\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	t.Cleanup(srv.Close)
+	c, err := New(Config{Name: "t", Kind: KindOpenAICompatible, BaseURL: srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got *Usage
+	if err := c.StreamChat(context.Background(), ChatRequest{Model: "m",
+		Messages: []ChatMessage{{Role: "user", Content: "hi"}}}, func(d Delta) error {
+		if d.Usage != nil {
+			got = d.Usage
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.InputTokens != 20 || got.OutputTokens != 8 || got.CachedTokens != 7 || got.ReasoningTokens != 5 {
+		t.Fatalf("usage detail = %+v, want 20/8 cached 7 reasoning 5", got)
+	}
+}
+
+// Anthropic's cache_read_input_tokens (message_start) is the prefix-cache
+// hit count the usage log's cache detail rides; cache *creation* is not a
+// hit and must not set it.
+func TestAnthropicCacheReadTokens(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":30,\"cache_read_input_tokens\":9,\"cache_creation_input_tokens\":4}}}\n\n"))
+		_, _ = w.Write([]byte("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":6}}\n\n"))
+		_, _ = w.Write([]byte("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
+	}))
+	t.Cleanup(srv.Close)
+	c, err := New(Config{Name: "a", Kind: KindAnthropic, BaseURL: srv.URL, APIKey: "k"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got *Usage
+	if err := c.StreamChat(context.Background(), ChatRequest{Model: "m", MaxTokens: 100,
+		Messages: []ChatMessage{{Role: "user", Content: "hi"}}}, func(d Delta) error {
+		if d.Usage != nil {
+			got = d.Usage
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.InputTokens != 30 || got.OutputTokens != 6 || got.CachedTokens != 9 {
+		t.Fatalf("anthropic usage = %+v, want cached 9 (creation 4 stays out)", got)
 	}
 }

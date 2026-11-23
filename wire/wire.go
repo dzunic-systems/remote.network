@@ -286,10 +286,17 @@ type InferenceRequestData struct {
 	// the normalized level (off|low|medium|high), MaxTokens the token
 	// budget (Anthropic budget_tokens; best-effort elsewhere).
 	Reasoning *ReasoningControl `json:"reasoning,omitempty"`
-	// Temperature is the consumer's sampling temperature (0..2);
-	// 0 = unset — the backend's own default applies. Backends without a
-	// knob ignore it.
-	Temperature float64 `json:"temperature,omitempty"`
+	// Temperature is the consumer's sampling temperature (0..2); nil =
+	// unset, the backend's own default applies; 0 is greedy decoding, as
+	// in every OpenAI-compatible API. Backends without a knob ignore it.
+	//
+	// Until 22 Nov this was a float64 with 0 meaning unset, so a consumer's
+	// stated 0 was dropped and the backend sampled at its default (1.0 on
+	// the Sparks): dossier's relevance judge, asking for 0, got two replays
+	// of the same sections agreeing on 14–62% of their verdicts. A node of
+	// before then still reads a 0 as unset; a consumer that must be greedy
+	// on every node sends 1e-6, as the canary does.
+	Temperature *float64 `json:"temperature,omitempty"`
 	// ResponseFormat carries a structured-output constraint: the
 	// node's backend enforces it when it can (vLLM guided decoding, Ollama
 	// format) and ignores it when it cannot — never a refusal. nil = free
@@ -377,12 +384,24 @@ type InferenceChunkData struct {
 // bounds it bills its own estimate and records an honesty disagreement. A
 // node therefore cannot over-bill past what it delivered, and an honest
 // speculative decoder (several tokens a chunk) is billed what it generated.
+//
+// CachedTokens/ReasoningTokens are detail the backend reported and the
+// router stores for the usage log (cache hit rate, thinking share). 0 =
+// unreported — a backend that cannot say stays silent; these are display
+// aggregates, never billed.
 type InferenceDoneData struct {
 	InputTokens  int `json:"input_tokens"`
 	OutputTokens int `json:"output_tokens"`
 	// Reasoning is set only when the request's thinking control was not met
 	// exactly. Older routers ignore it.
 	Reasoning *ReasoningOutcome `json:"reasoning,omitempty"`
+	// CachedTokens is the prefix-cache hit count among InputTokens (OpenAI
+	// prompt_tokens_details.cached_tokens, Anthropic
+	// cache_read_input_tokens). ReasoningTokens is the reasoning portion of
+	// OutputTokens (OpenAI completion_tokens_details.reasoning_tokens).
+	// Both omitempty: old routers ignore them, old nodes send none.
+	CachedTokens    int `json:"cached_tokens,omitempty"`
+	ReasoningTokens int `json:"reasoning_tokens,omitempty"`
 }
 
 // ReasoningOutcome says what became of a ReasoningControl the backend could

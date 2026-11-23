@@ -81,9 +81,9 @@ type ChatRequest struct {
 	Tools      []ToolSpec
 	ToolChoice string                 // "" | "auto" | "any" | "none" | "name:<tool>"
 	Reasoning  *wire.ReasoningControl // nil = backend default
-	// Temperature is the consumer's sampling knob (0 = backend default);
-	// backends without one ignore it.
-	Temperature float64
+	// Temperature is the consumer's sampling knob (nil = backend default,
+	// 0 = greedy); backends without one ignore it.
+	Temperature *float64
 	// ResponseFormat carries a structured-output constraint: enforce
 	// when the backend can, ignore when it cannot — never refuse.
 	ResponseFormat *wire.ResponseFormat
@@ -93,10 +93,17 @@ type ChatRequest struct {
 }
 
 // Usage is token accounting when the backend reports it (bench counts
-// deltas independently — never trust, always cross-check).
+// deltas independently — never trust, always cross-check). CachedTokens is
+// the prefix-cache hit count among InputTokens (OpenAI
+// prompt_tokens_details.cached_tokens, Anthropic cache_read_input_tokens);
+// ReasoningTokens the thinking portion of OutputTokens (OpenAI
+// completion_tokens_details.reasoning_tokens). 0 = unreported — detail for
+// the usage log, never billed.
 type Usage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
+	InputTokens     int `json:"input_tokens"`
+	OutputTokens    int `json:"output_tokens"`
+	CachedTokens    int `json:"cached_tokens,omitempty"`
+	ReasoningTokens int `json:"reasoning_tokens,omitempty"`
 }
 
 // Delta is one uniform streaming event, already translated from whatever

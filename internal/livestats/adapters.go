@@ -140,6 +140,13 @@ func (a *adapterState) isOllama(ctx context.Context) bool {
 	return ok && len(m) > 0 && m[0] == '['
 }
 
+// detected is the last dialect detection, without probing.
+func (a *adapterState) detected() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.dialect
+}
+
 func (a *adapterState) fetch(ctx context.Context, path string) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.base+path, nil)
 	if err != nil {

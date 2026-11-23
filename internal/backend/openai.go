@@ -382,10 +382,18 @@ type oaStreamOpts struct {
 	IncludeUsage bool `json:"include_usage"`
 }
 
-// oaUsage is the OpenAI wire shape, mapped into our uniform Usage.
+// oaUsage is the OpenAI wire shape, mapped into our uniform Usage. The
+// detail blocks (cache hits, reasoning share) are optional on every
+// compliant server — absent means unreported, never 0.
 type oaUsage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
+	PromptTokens        int `json:"prompt_tokens"`
+	CompletionTokens    int `json:"completion_tokens"`
+	PromptTokensDetails *struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"prompt_tokens_details,omitempty"`
+	CompletionTokensDetails *struct {
+		ReasoningTokens int `json:"reasoning_tokens"`
+	} `json:"completion_tokens_details,omitempty"`
 }
 
 type oaChunk struct {
@@ -483,8 +491,8 @@ func (c *openaiClient) StreamChat(ctx context.Context, r ChatRequest, onDelta fu
 		rung = c.startRung(rungKey, ladder)
 	}
 	var temperature *float64
-	if r.Temperature > 0 {
-		t := r.Temperature
+	if r.Temperature != nil {
+		t := *r.Temperature
 		temperature = &t
 	}
 	var priority *int
@@ -548,6 +556,12 @@ func (c *openaiClient) StreamChat(ctx context.Context, r ChatRequest, onDelta fu
 		var usage *Usage
 		if chunk.Usage != nil {
 			usage = &Usage{InputTokens: chunk.Usage.PromptTokens, OutputTokens: chunk.Usage.CompletionTokens}
+			if chunk.Usage.PromptTokensDetails != nil {
+				usage.CachedTokens = chunk.Usage.PromptTokensDetails.CachedTokens
+			}
+			if chunk.Usage.CompletionTokensDetails != nil {
+				usage.ReasoningTokens = chunk.Usage.CompletionTokensDetails.ReasoningTokens
+			}
 		}
 		d := Delta{Usage: usage}
 		if len(chunk.Choices) > 0 {

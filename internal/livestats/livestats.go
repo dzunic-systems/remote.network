@@ -157,7 +157,9 @@ func (s *Sampler) round(ctx context.Context) {
 			cancel()
 			if running != nil || waiting != nil || kv != nil || mem != nil {
 				agent.Source = "metrics"
-				if b.Kind == "ollama" {
+				// Ollama answers /api/ps, not /metrics; it is usually registered
+				// openai-compatible, so the detected dialect names it, not the kind.
+				if b.Kind == "ollama" || adapter.detected() == "ollama" {
 					agent.Source = "api"
 				}
 			}

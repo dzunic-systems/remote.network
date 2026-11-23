@@ -1279,6 +1279,11 @@ func (rt *Runtime) HandleInference(ctx context.Context, req wire.InferenceReques
 	}, func(d backend.Delta) error {
 		if d.Usage != nil {
 			done.InputTokens, done.OutputTokens = d.Usage.InputTokens, d.Usage.OutputTokens
+			// Usage-log detail (usage-log-and-trends.md): cache hits and the
+			// reasoning share ride the done frame when the backend reported
+			// them; unreporting backends leave them 0 (stored as unknown,
+			// never a zero reading).
+			done.CachedTokens, done.ReasoningTokens = d.Usage.CachedTokens, d.Usage.ReasoningTokens
 		}
 		if d.ReasoningOutcome != nil {
 			done.Reasoning = d.ReasoningOutcome

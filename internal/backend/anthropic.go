@@ -111,9 +111,14 @@ type anContentDelta struct {
 	PartialJSON string `json:"partial_json"`
 }
 
+// anUsage is Anthropic's usage block. CacheReadInputTokens is the
+// prefix-cache hit count (billed at the cache-read rate, not the input
+// rate) — the usage log's cache-hit detail. Cache *creation* tokens are
+// billed as input at a premium and are not a hit, so they stay out.
 type anUsage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
+	InputTokens          int `json:"input_tokens"`
+	OutputTokens         int `json:"output_tokens"`
+	CacheReadInputTokens int `json:"cache_read_input_tokens"`
 }
 
 // anMessageOut is one outgoing Anthropic message with block-array content —
@@ -222,9 +227,11 @@ func (c *anthropicClient) StreamChat(ctx context.Context, r ChatRequest, onDelta
 		r.MaxTokens = maxTok
 		thinking = &anThinking{Type: "enabled", BudgetTokens: budget}
 	}
+	// Anthropic takes 0..1, and none at all with thinking on (any value but
+	// 1 is a 400 then), so the knob rides only without thinking.
 	var temperature *float64
-	if r.Temperature > 0 && r.Temperature <= 1 {
-		t := r.Temperature
+	if r.Temperature != nil && *r.Temperature >= 0 && *r.Temperature <= 1 && thinking == nil {
+		t := *r.Temperature
 		temperature = &t
 	}
 	body, err := json.Marshal(anStreamRequest{
@@ -335,6 +342,7 @@ func (c *anthropicClient) StreamChat(ctx context.Context, r ChatRequest, onDelta
 			}
 			if json.Unmarshal(data, &wrap) == nil && wrap.Message.Usage != nil {
 				usage.InputTokens = wrap.Message.Usage.InputTokens
+				usage.CachedTokens = wrap.Message.Usage.CacheReadInputTokens
 			}
 			return true, nil
 		case "message_delta":
