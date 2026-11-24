@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -69,6 +71,7 @@ func DialNode(ctx context.Context, tr *quic.Transport, endpoints []string, clien
 	}
 	const stagger = 250 * time.Millisecond
 	type result struct {
+		ep   string
 		conn *quic.Conn
 		err  error
 	}
@@ -78,21 +81,24 @@ func DialNode(ctx context.Context, tr *quic.Transport, endpoints []string, clien
 	for i, ep := range endpoints {
 		addr, err := net.ResolveUDPAddr("udp", ep)
 		if err != nil {
-			results <- result{err: err}
+			results <- result{ep: ep, err: err}
 			continue
 		}
-		go func(i int, addr *net.UDPAddr) {
+		go func(i int, ep string, addr *net.UDPAddr) {
 			select {
 			case <-time.After(time.Duration(i) * stagger):
 			case <-ctx.Done():
-				results <- result{err: ctx.Err()}
+				results <- result{ep: ep, err: ctx.Err()}
 				return
 			}
 			conn, err := tr.Dial(ctx, addr, tlsCfg.Clone(), DirectQUICConfig())
-			results <- result{conn: conn, err: err}
-		}(i, addr)
+			results <- result{ep: ep, conn: conn, err: err}
+		}(i, ep, addr)
 	}
-	var lastErr error
+	// Every endpoint's own failure is kept: the last one alone hides the
+	// informative one (a fast key mismatch on the LAN address behind a slow
+	// timeout on the public one).
+	var errs []string
 	for range endpoints {
 		r := <-results
 		if r.err == nil {
@@ -106,9 +112,10 @@ func DialNode(ctx context.Context, tr *quic.Transport, endpoints []string, clien
 			}()
 			return r.conn, nil
 		}
-		lastErr = r.err
+		errs = append(errs, r.ep+": "+r.err.Error())
 	}
-	return nil, fmt.Errorf("%w: %v", ErrNoDirectPath, lastErr)
+	sort.Strings(errs)
+	return nil, fmt.Errorf("%w: %s", ErrNoDirectPath, strings.Join(errs, "; "))
 }
 
 // Ping opens a stream, sends direct.ping and reads the node's answer.

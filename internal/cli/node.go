@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -253,10 +254,26 @@ func newStartCommand() *cobra.Command {
 			// the whole node, shared by every router session like the
 			// in-flight counter. Off by default until the field test.
 			var clientListener *ingress.ClientListener
+			var fleetRef atomic.Pointer[ingress.Fleet] // read by the listener's goroutine
 			if clientDirect {
 				cl, err := ingress.StartClientListener(runCtx, ingress.ClientListenerConfig{
 					Identity: priv, Port: clientPort, RouterURLs: routerURLs,
 					AgentVersion: Version, Log: log,
+					// The fleet's attached routers: the NAT test needs a second
+					// router on another IP. The fleet is built just below; until
+					// then the seeds alone are asked.
+					KnownRouterURLs: func() []string {
+						f := fleetRef.Load()
+						if f == nil {
+							return nil
+						}
+						urls := make([]string, 0, 8)
+						for u := range f.Clients() {
+							urls = append(urls, u)
+						}
+						sort.Strings(urls)
+						return urls
+					},
 				})
 				if err != nil {
 					return fmt.Errorf("--client-direct: %w", err)
@@ -292,6 +309,7 @@ func newStartCommand() *cobra.Command {
 				},
 				Log: log,
 			})
+			fleetRef.Store(fleet)
 			gate.set = fleet.SetServingModels
 			gate.notify = fleet.SendCapabilityUpdate
 			openNow := gate.apply()

@@ -46,11 +46,15 @@ const (
 
 // ClientListenerConfig configures the client listener.
 type ClientListenerConfig struct {
-	Identity     ed25519.PrivateKey
-	Port         int      // UDP port; 0 = any free port
-	RouterURLs   []string // the node's --router seeds (ws(s)://…); /direct/info is read from them
-	AgentVersion string
-	Log          *slog.Logger
+	Identity   ed25519.PrivateKey
+	Port       int      // UDP port; 0 = any free port
+	RouterURLs []string // the node's --router seeds (ws(s)://…); /direct/info is read from them
+	// KnownRouterURLs lists every router the node is attached to (the
+	// fleet's directory): the NAT test needs a second router on a
+	// different IP. Nil = the seeds only.
+	KnownRouterURLs func() []string
+	AgentVersion    string
+	Log             *slog.Logger
 	// HTTPClient reads /direct/info (nil = a 10 s timeout client).
 	HTTPClient *http.Client
 	// LANAddrs overrides the machine's LAN address discovery (tests).
@@ -71,13 +75,10 @@ type ClientListener struct {
 	info   atomic.Pointer[wire.DirectClientInfo]
 	offers atomic.Int64
 
-	mu       sync.Mutex
-	conns    int
-	perIP    map[string]int
-	routerUD struct {
-		main, alt *net.UDPAddr
-		at        time.Time
-	}
+	mu         sync.Mutex
+	conns      int
+	perIP      map[string]int
+	routerInfo map[string]routerUDP // router URL → its punch sockets
 }
 
 // StartClientListener binds the socket, starts the QUIC listener, the
@@ -106,6 +107,8 @@ func StartClientListener(ctx context.Context, cfg ClientListenerConfig) (*Client
 		nodeID: identity.ID(cfg.Identity.Public().(ed25519.PublicKey)),
 		sock:   sock,
 		perIP:  map[string]int{},
+
+		routerInfo: map[string]routerUDP{},
 	}
 	l.tr = &quic.Transport{
 		Conn: sock,
@@ -162,6 +165,16 @@ func (l *ClientListener) admit(ctx context.Context, ci *quic.ClientInfo) (contex
 	}
 	l.conns++
 	l.perIP[ip]++
+	// The slot is released when the connection ends, however it ends:
+	// quic-go cancels this context on close, including a handshake that
+	// fails or is abandoned — such a connection never reaches Accept, so
+	// releasing in serveConn alone leaked its slot until the per-IP cap
+	// locked that address out.
+	addr := ci.RemoteAddr
+	go func() {
+		<-ctx.Done()
+		l.release(addr)
+	}()
 	return ctx, nil
 }
 
@@ -203,7 +216,6 @@ func (l *ClientListener) accept(ctx context.Context) {
 // gets a pong; anything else is told the node does not serve direct
 // requests yet.
 func (l *ClientListener) serveConn(conn *quic.Conn) {
-	defer l.release(conn.RemoteAddr())
 	peer, _ := identity.PeerIdentity(conn.ConnectionState().TLS)
 	l.log.Debug("direct connection", "remote", conn.RemoteAddr().String(), "client", peer)
 	ctx := conn.Context()
@@ -261,17 +273,29 @@ func (l *ClientListener) keepalive(ctx context.Context) {
 }
 
 func (l *ClientListener) observeOnce(ctx context.Context) {
-	main, alt, err := l.routerUDP(ctx)
+	routers, err := l.routerUDPs(ctx)
 	if err != nil {
 		l.log.Warn("client listener: no router observe endpoint", "err", err)
 		return
 	}
+	local := l.sock.LocalAddr().String()
 	octx, cancel := context.WithTimeout(ctx, clientObserveTimeout)
 	defer cancel()
-	obs, err := l.obs.Observe(octx, l.sock.LocalAddr().String(), main, alt)
+	obs, err := l.obs.Observe(octx, local, routers[0].main, routers[0].alt)
 	if err != nil {
 		l.log.Warn("client listener: observe failed", "err", err)
 		return
+	}
+	// The first round compares two ports of ONE router: it catches a NAT
+	// that maps per destination port, not one that maps per destination
+	// IP (address-dependent mapping), which defeats hole punching just the
+	// same. Asking a second router, on another IP, catches that too.
+	mapping := "one router"
+	if obs.Candidate && len(routers) > 1 {
+		octx2, cancel2 := context.WithTimeout(ctx, clientObserveTimeout)
+		cross, err := l.obs.Observe(octx2, local, routers[0].main, routers[1].main)
+		cancel2()
+		obs, mapping = combineNAT(obs, cross, err)
 	}
 	port := l.Addr().Port
 	endpoints := []string{obs.Main}
@@ -284,32 +308,84 @@ func (l *ClientListener) observeOnce(ctx context.Context) {
 	prev := l.info.Load()
 	l.info.Store(&wire.DirectClientInfo{Endpoints: endpoints, NAT: obs.NAT, MaxConns: clientMaxConns})
 	if prev == nil || prev.Endpoints[0] != obs.Main || prev.NAT != obs.NAT {
-		l.log.Info("client listener reachable", "public", obs.Main, "nat", obs.NAT, "candidate", obs.Candidate)
+		l.log.Info("client listener reachable", "public", obs.Main, "nat", obs.NAT,
+			"candidate", obs.Candidate, "tested_against", mapping)
 	}
 }
 
-// routerUDP returns a router's punch sockets, read from the first seed
-// that answers GET /api/v1/direct/info, cached for clientInfoTTL.
-func (l *ClientListener) routerUDP(ctx context.Context) (*net.UDPAddr, *net.UDPAddr, error) {
-	l.mu.Lock()
-	cached := l.routerUD
-	l.mu.Unlock()
-	if cached.main != nil && time.Since(cached.at) < clientInfoTTL {
-		return cached.main, cached.alt, nil
+// combineNAT folds the cross-router round into the first round's verdict:
+// a mapping that differs between two router IPs is address-dependent —
+// symmetric for hole punching. mapping says what the verdict rests on.
+func combineNAT(first, cross clientproto.Observation, crossErr error) (clientproto.Observation, string) {
+	switch {
+	case crossErr != nil:
+		return first, "one router (second router did not answer)"
+	case cross.NAT == wire.NATSymmetric:
+		first.NAT, first.Candidate = wire.NATSymmetric, false
+		return first, "two routers: address-dependent mapping"
+	default:
+		return first, "two routers"
 	}
+}
+
+// routerUDP is one router's punch sockets.
+type routerUDP struct {
+	main, alt *net.UDPAddr
+	at        time.Time
+}
+
+// routerUDPs returns up to two routers' punch sockets on DIFFERENT IPs —
+// seeds first, then the routers the fleet attached — each read from
+// GET /api/v1/direct/info and cached for clientInfoTTL. One router is
+// enough to run; two make the NAT test stronger.
+func (l *ClientListener) routerUDPs(ctx context.Context) ([]routerUDP, error) {
+	urls := append([]string{}, l.cfg.RouterURLs...)
+	if l.cfg.KnownRouterURLs != nil {
+		urls = append(urls, l.cfg.KnownRouterURLs()...)
+	}
+	var out []routerUDP
+	seenIP := map[string]bool{}
+	seenURL := map[string]bool{}
 	var lastErr error = errors.New("no router configured")
-	for _, ru := range l.cfg.RouterURLs {
-		main, alt, err := fetchDirectInfo(ctx, l.cfg.HTTPClient, ru)
-		if err != nil {
-			lastErr = err
+	for _, u := range urls {
+		if len(out) == 2 {
+			break
+		}
+		if seenURL[u] {
 			continue
 		}
+		seenURL[u] = true
 		l.mu.Lock()
-		l.routerUD.main, l.routerUD.alt, l.routerUD.at = main, alt, time.Now()
+		r, ok := l.routerInfo[u]
 		l.mu.Unlock()
-		return main, alt, nil
+		if !ok || time.Since(r.at) > clientInfoTTL {
+			main, alt, err := fetchDirectInfo(ctx, l.cfg.HTTPClient, u)
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			r = routerUDP{main: main, alt: alt, at: time.Now()}
+			l.mu.Lock()
+			l.routerInfo[u] = r
+			l.mu.Unlock()
+		}
+		ip := r.main.IP
+		if seenIP[ip.String()] {
+			continue
+		}
+		// The second router must speak the same IP family: an IPv4 and an
+		// IPv6 observation always differ, which would make every network
+		// look symmetric.
+		if len(out) == 1 && (out[0].main.IP.To4() == nil) != (ip.To4() == nil) {
+			continue
+		}
+		seenIP[ip.String()] = true
+		out = append(out, r)
 	}
-	return nil, nil, lastErr
+	if len(out) == 0 {
+		return nil, lastErr
+	}
+	return out, nil
 }
 
 // fetchDirectInfo reads a router's /api/v1/direct/info. routerURL may be
