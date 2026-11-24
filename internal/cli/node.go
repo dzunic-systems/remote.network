@@ -131,6 +131,8 @@ func newStartCommand() *cobra.Command {
 		noDirect       bool
 		noReverseQUIC  bool
 		simulateSymNat bool
+		clientDirect   bool
+		clientPort     int
 		priceIn        int
 		priceOut       int
 		serveHours     []string
@@ -247,6 +249,21 @@ func newStartCommand() *cobra.Command {
 					}
 					return out
 				}, log)
+			// The client listener (direct client→node path): one socket for
+			// the whole node, shared by every router session like the
+			// in-flight counter. Off by default until the field test.
+			var clientListener *ingress.ClientListener
+			if clientDirect {
+				cl, err := ingress.StartClientListener(runCtx, ingress.ClientListenerConfig{
+					Identity: priv, Port: clientPort, RouterURLs: routerURLs,
+					AgentVersion: Version, Log: log,
+				})
+				if err != nil {
+					return fmt.Errorf("--client-direct: %w", err)
+				}
+				defer cl.Close()
+				clientListener = cl
+			}
 			fleet = ingress.NewFleet(ingress.FleetConfig{
 				Seeds:  routerURLs,
 				Strict: routerStrict,
@@ -259,6 +276,7 @@ func newStartCommand() *cobra.Command {
 					RouterRoot:   routerRoot,
 					NodeToken:    nodeToken,
 					NodeInFlight: nodeInFlight,
+					DirectClient: clientListener,
 					Stats:        sampler.Latest,
 					Log:          log,
 					OnReprobe: func(all bool, models []string) bool {
@@ -411,6 +429,10 @@ func newStartCommand() *cobra.Command {
 		"never upgrade to the hole-punched direct QUIC path (stay on the WSS relay)")
 	cmd.Flags().BoolVar(&noReverseQUIC, "no-reverse-quic", false,
 		"never dial the router's public QUIC endpoint for the node-dialed data plane (symmetric-NAT nodes use it to leave the relay)")
+	cmd.Flags().BoolVar(&clientDirect, "client-direct", false,
+		"accept direct QUIC connections from remote-client users (opens one UDP port; this release answers reachability checks only)")
+	cmd.Flags().IntVar(&clientPort, "client-port", 0,
+		"UDP port of the --client-direct listener (0 = any free port; set one you forward on your router for clients behind strict NATs)")
 	cmd.Flags().BoolVar(&simulateSymNat, "simulate-symmetric-nat", false,
 		"test hook: report a symmetric NAT so the router keeps this node on the relay")
 	cmd.Flags().IntVar(&priceIn, "price-in-per-1m", 0,

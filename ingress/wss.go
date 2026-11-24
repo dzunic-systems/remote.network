@@ -19,6 +19,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"remote.network/node/clientproto"
 	"remote.network/node/identity"
 	"remote.network/node/wire"
 )
@@ -106,6 +107,12 @@ type Config struct {
 	// client through the shared Base config. Nil (legacy callers, tests):
 	// the client counts only itself and heartbeats scope "conn".
 	NodeInFlight *atomic.Int64
+
+	// DirectClient is the node's client listener (clientlisten.go), shared
+	// by every client of the fleet like NodeInFlight: its reachability
+	// rides every heartbeat, and routers' direct.offers reach it. Nil = no
+	// listener (`node start` without --client-direct).
+	DirectClient *ClientListener
 
 	// Stats is the sampler's newest machine + backend reading, attached to every heartbeat. Nil = heartbeats carry
 	// no stats object (the pre-v0.1.6 wire shape).
@@ -396,6 +403,12 @@ func (c *Client) readLoop(ctx context.Context, conn *websocket.Conn, nodeID stri
 			if cancel, ok := c.cancels.LoadAndDelete(env.ReqID); ok && env.ReqID != "" {
 				cancel.(context.CancelFunc)()
 			}
+		case wire.TypeDirectOffer:
+			var d wire.DirectOfferData
+			if c.cfg.DirectClient == nil || json.Unmarshal(env.Data, &d) != nil {
+				continue
+			}
+			c.cfg.DirectClient.Offer(d)
 		case wire.TypePunchBegin:
 			var d wire.PunchBeginData
 			if err := json.Unmarshal(env.Data, &d); err != nil {
@@ -543,15 +556,52 @@ func (c *Client) runHandler(ctx context.Context, reqID string, req wire.Inferenc
 	c.acquireInflight()
 	defer c.releaseInflight()
 
-	done, err = c.cfg.Handler.HandleInference(ctx, req, emit)
+	start := time.Now()
+	var firstChunk time.Time
+	timed := func(chunk wire.InferenceChunkData) error {
+		if firstChunk.IsZero() {
+			firstChunk = time.Now()
+		}
+		return emit(chunk)
+	}
+	done, err = c.cfg.Handler.HandleInference(ctx, req, timed)
 	if err != nil {
 		code = "backend_error"
 		if errors.Is(err, wire.ErrBusy) {
 			code = "busy"
 		}
 		c.log.Warn("inference failed", "req_id", reqID, "model", req.Model, "code", code, "err", err)
+		return done, code, err
 	}
+	done.Receipt = c.signReceipt(reqID, req.Model, done, start, firstChunk)
 	return done, code, err
+}
+
+// signReceipt is the node's signed account of a served request
+// riding on inference.done. Every data plane
+// (relay, router QUIC, later the client listener) goes through runHandler,
+// so every completed request carries one. A signing failure never fails
+// the request — the router still has its own count.
+func (c *Client) signReceipt(reqID, model string, done wire.InferenceDoneData, start, firstChunk time.Time) *wire.UsageReceipt {
+	if c.cfg.Identity == nil {
+		return nil
+	}
+	end := time.Now()
+	ttft := 0
+	if !firstChunk.IsZero() {
+		ttft = int(firstChunk.Sub(start).Milliseconds())
+	}
+	r, err := clientproto.SignReceipt(c.cfg.Identity, wire.UsageReceipt{
+		RequestID: reqID, ModelID: model,
+		InputTokens: done.InputTokens, OutputTokens: done.OutputTokens,
+		CachedTokens: done.CachedTokens, ReasoningTokens: done.ReasoningTokens,
+		Status: "ok", TTFTms: ttft, TotalMs: int(end.Sub(start).Milliseconds()), At: end.Unix(),
+	})
+	if err != nil {
+		c.log.Warn("receipt signing failed", "req_id", reqID, "err", err)
+		return nil
+	}
+	return &r
 }
 
 func (c *Client) heartbeatLoop(ctx context.Context, conn *websocket.Conn, nodeID string, interval time.Duration) {
@@ -598,6 +648,9 @@ func (c *Client) heartbeatData() wire.HeartbeatData {
 	}
 	if c.cfg.Stats != nil {
 		hb.Stats = c.cfg.Stats()
+	}
+	if c.cfg.DirectClient != nil {
+		hb.DirectClient = c.cfg.DirectClient.Info()
 	}
 	return hb
 }

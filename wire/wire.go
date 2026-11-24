@@ -52,7 +52,49 @@ const (
 	TypePunchBegin    = "punch.begin"    // router→node: punch endpoints + nonce
 	TypePunchObserved = "punch.observed" // router→node: what the probes looked like
 	TypePunchReport   = "punch.report"   // node→router: NAT class + candidacy
+
+	// Direct client→node path (node v0.1.11+).
+	TypeDirectOffer = "direct.offer" // router→node: a client is about to dial — open the NAT toward it
+	// On a client-listener stream (client↔node, never the router channel):
+	TypeDirectPing = "direct.ping" // client→node: reachability check
+	TypeDirectPong = "direct.pong" // node→client: who answered
 )
+
+// DirectPongData answers a direct.ping on a client-listener stream.
+type DirectPongData struct {
+	NodeID       string `json:"node_id"`
+	AgentVersion string `json:"agent_version"`
+	Serving      bool   `json:"serving"` // the listener answers direct.request (a later release)
+}
+
+// DirectClientALPN is the TLS application protocol of a node's client
+// listener — distinct from the router plane's "remote.quic", so neither
+// listener can ever be mistaken for the other.
+const DirectClientALPN = "remote.client"
+
+// DirectClientInfo is what a node's client listener tells routers in every
+// heartbeat: where direct clients can reach it, and through what NAT.
+// Absent = the node runs without a client listener (the default).
+type DirectClientInfo struct {
+	// Endpoints: the router-observed public address first, then the
+	// machine's own LAN addresses (for clients on the same network).
+	Endpoints []string `json:"endpoints"`
+	NAT       string   `json:"nat"`       // open | cone | symmetric | unknown
+	MaxConns  int      `json:"max_conns"` // the listener's connection cap
+	// Serving says the listener answers direct.request streams; false = it
+	// only completes handshakes (reachability checks, node v0.1.11).
+	Serving bool `json:"serving,omitempty"`
+}
+
+// DirectOfferData asks a node to open its NAT toward a client that is
+// about to dial its client listener: the node sends a short burst of UDP
+// from the listener socket to each address.
+type DirectOfferData struct {
+	TicketID    string   `json:"ticket_id,omitempty"` // "" for a reachability check (doctor)
+	ClientPub   string   `json:"client_pub"`          // the key the client's TLS certificate will carry
+	ClientAddrs []string `json:"client_addrs"`        // its router-observed public address, then LAN addresses
+	NotAfter    int64    `json:"not_after"`           // unix seconds; a stale offer is ignored
+}
 
 // Envelope is the outer wire format for every message in both directions.
 type Envelope struct {
@@ -170,6 +212,9 @@ type HeartbeatData struct {
 	InFlightScope string     `json:"in_flight_scope,omitempty"`
 	ServingModels []string   `json:"serving_models,omitempty"`
 	Stats         *NodeStats `json:"stats,omitempty"`
+	// DirectClient is the client listener's reachability (node v0.1.11+,
+	// only when started with --client-direct).
+	DirectClient *DirectClientInfo `json:"direct_client,omitempty"`
 }
 
 // NodeStats is one 5-second sample of the machine and its backends.
@@ -402,6 +447,37 @@ type InferenceDoneData struct {
 	// Both omitempty: old routers ignore them, old nodes send none.
 	CachedTokens    int `json:"cached_tokens,omitempty"`
 	ReasoningTokens int `json:"reasoning_tokens,omitempty"`
+	// Receipt is the node's signed account of this request (node
+	// v0.1.11+). Routers verify and record it
+	// beside their own count; the direct path will bill by it. Old routers
+	// ignore it, old nodes send none.
+	Receipt *UsageReceipt `json:"receipt,omitempty"`
+}
+
+// ReceiptVersion is the UsageReceipt shape this build signs and verifies.
+// A field added to UsageReceipt bumps it: a verifier that does not know
+// the new field would re-encode the payload without it and reject the
+// signature, so it must refuse the version up front instead.
+const ReceiptVersion = 1
+
+// UsageReceipt is a node's signed statement of one served request. The
+// node's identity key signs the JSON encoding of every field but Sig
+// (clientproto.SignReceipt / VerifyReceipt).
+type UsageReceipt struct {
+	V               int    `json:"v"`
+	TicketID        string `json:"ticket_id,omitempty"` // "" on the router-relayed path (no ticket)
+	RequestID       string `json:"request_id"`          // the dispatch's req_id as the node received it
+	NodeID          string `json:"node_id"`
+	ModelID         string `json:"model_id"` // the model as the node received it
+	InputTokens     int    `json:"input_tokens"`
+	OutputTokens    int    `json:"output_tokens"`
+	CachedTokens    int    `json:"cached_tokens,omitempty"`
+	ReasoningTokens int    `json:"reasoning_tokens,omitempty"`
+	Status          string `json:"status"`   // ok (a failed request sends inference.error and no receipt)
+	TTFTms          int    `json:"ttft_ms"`  // node-measured: handler start → first chunk
+	TotalMs         int    `json:"total_ms"` // node-measured: handler start → done
+	At              int64  `json:"at"`       // unix seconds, node clock
+	Sig             string `json:"sig"`      // base64 std Ed25519 signature
 }
 
 // ReasoningOutcome says what became of a ReasoningControl the backend could

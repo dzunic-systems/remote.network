@@ -8,7 +8,6 @@
 package ingress
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -19,6 +18,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/quic-go/quic-go"
 
+	"remote.network/node/clientproto"
 	"remote.network/node/identity"
 	"remote.network/node/wire"
 )
@@ -226,8 +226,7 @@ func (c *Client) acceptQUIC(ctx context.Context, listener *quic.Listener) {
 // serveQUICStream serves one request over one stream. Router-side cancel
 // resets the stream, which cancels stream.Context() → generation stops.
 func (c *Client) serveQUICStream(stream *quic.Stream) {
-	sc := bufio.NewScanner(stream)
-	sc.Buffer(make([]byte, 64*1024), 2<<20)
+	sc := clientproto.NewEnvelopeScanner(stream)
 	if !sc.Scan() {
 		if err := sc.Err(); err != nil {
 			c.log.Warn("quic stream: request read failed", "err", err)
@@ -248,13 +247,7 @@ func (c *Client) serveQUICStream(stream *quic.Stream) {
 		if err != nil {
 			return err
 		}
-		b, err := json.Marshal(out)
-		if err != nil {
-			return err
-		}
-		_ = stream.SetWriteDeadline(time.Now().Add(writeWait))
-		_, err = stream.Write(append(b, '\n'))
-		return err
+		return clientproto.WriteEnvelope(stream, out, writeWait)
 	}
 
 	// The stream's context dies on reset/close — that is the cancel path.
@@ -333,14 +326,5 @@ func (c *Client) sendPunchReport(conn *websocket.Conn, nodeID, nonce, natType st
 //	observed main == alt      → cone → candidate (router dials observed main)
 //	otherwise                 → symmetric → relay fallback (by policy)
 func classifyNAT(local, main, alt string) (string, bool) {
-	if main == "" || alt == "" {
-		return "unknown", false
-	}
-	if main == local && alt == local {
-		return wire.NATOpen, true
-	}
-	if main == alt {
-		return wire.NATCone, true
-	}
-	return wire.NATSymmetric, false
+	return clientproto.ClassifyNAT(local, main, alt)
 }
