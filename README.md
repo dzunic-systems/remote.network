@@ -173,8 +173,31 @@ the router's challenge on every connect. It trusts routers by key: pin the
 network's root key with `--router-root` (recommended), pin one router with
 `--router-key`, or with neither it pins the first router it meets.
 Requests reach the agent over WSS, upgraded to a direct QUIC connection
-when the NAT allows (`--no-direct` keeps the relay). The agent never
-accepts inbound connections.
+to its router when the NAT allows (`--no-direct` keeps the relay).
+
+### Direct client connections (on by default)
+
+Since v0.1.14 the agent also serves [remote-client](https://github.com/dzunic-systems/remote.network-client)
+users directly over QUIC, so their answers skip the router hop and the
+router never sees the content. Billing is unchanged: the agent signs a
+receipt for what it served, and the router bills it within the limits of
+the ticket it issued.
+
+What that means for you:
+
+- Users the router sends to this node learn its **public IP** (your
+  connection's address: roughly where you are, and your ISP) and its
+  **LAN addresses** (private, not reachable from the internet).
+- The agent listens on **one UDP port** (`--client-port`, any free port by
+  default). Behind a home router nothing is open to the internet: only a
+  user the router named gets through, after the agent sends packets toward
+  that user. On a machine with a public IP and no firewall, anyone can
+  reach the port, but only requests carrying a router-signed ticket for
+  this node are served.
+
+To keep this node's addresses private, run with `--no-client-direct`:
+remote-client users then reach it through a router, like everyone else.
+The service installers explain this and ask once.
 
 The protocol between nodes and routers is in [PROTOCOL.md](PROTOCOL.md).
 

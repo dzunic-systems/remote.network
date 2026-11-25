@@ -81,6 +81,43 @@ if [ -z "$TOK" ]; then
 fi
 case "$TOK" in rn_nt_*) ;; *) echo "not a node token (they start with rn_nt_)" >&2; exit 1 ;; esac
 
+# Direct client connections: on by default (agent v0.1.14+). Say what that
+# means and offer the opt-out once, unless the flags already decide it or
+# there is no terminal to ask (then it stays on; the notice still prints).
+case " $FLAGS " in
+  *" --no-client-direct "*) echo "direct:  off (--no-client-direct) — remote-client users reach this node through a router" ;;
+  *)
+    cat <<'NOTE'
+
+Direct client connections (on by default)
+  remote-client users can be served straight from this node instead of
+  through a router: faster answers, and the router never sees the content.
+  What it means for you:
+  - those users learn this node's public IP (your connection's address —
+    roughly where you are, your ISP) and its LAN addresses;
+  - the node listens on one UDP port. Behind a home router nothing is open
+    to the internet: only a user the router sends here gets through, after
+    the node opens the way to that user. On a machine with a public IP and
+    no firewall, anyone can reach the port, but only router-ticketed
+    requests are served.
+  Turn it off if you would rather keep this node's addresses private:
+  re-run with  -- --no-client-direct
+
+NOTE
+    case " $FLAGS " in
+      *" --client-direct "*) ;;
+      *)
+        if (: </dev/tty) 2>/dev/null; then
+          printf 'serve remote-client users directly? [Y/n] ' >/dev/tty || true
+          read -r ANS </dev/tty || ANS=
+          case "$ANS" in
+            [nN]*) FLAGS="$FLAGS --no-client-direct"; echo "direct:  off" ;;
+            *) echo "direct:  on" ;;
+          esac
+        fi ;;
+    esac ;;
+esac
+
 mkdir -p "$H"
 chmod 700 "$H"
 ( umask 077; printf 'NODE_TOKEN=%s\nROUTER_ROOT=%s\nROUTER=%s\n' "$TOK" "$ROOT" "$ROUTER" > "$ENVF" )

@@ -77,6 +77,34 @@ Set-Content -Path $tf -Value $tok -NoNewline -Encoding ascii
 Remove-Variable tok
 icacls $tf /inheritance:r /grant:r "*${sid}:(R,W)" "*S-1-5-18:(F)" | Out-Null
 
+# Direct client connections: on by default (agent v0.1.14+). Say what that
+# means and offer the opt-out once, unless the options already decide it
+# or there is no console to ask (then it stays on).
+if ($ExtraArgs.Contains("--no-client-direct")) {
+  Write-Host "direct: off (--no-client-direct) - remote-client users reach this node through a router"
+} else {
+  Write-Host ""
+  Write-Host "Direct client connections (on by default)"
+  Write-Host "  remote-client users can be served straight from this node instead of"
+  Write-Host "  through a router: faster answers, and the router never sees the content."
+  Write-Host "  What it means for you:"
+  Write-Host "  - those users learn this node's public IP (your connection's address -"
+  Write-Host "    roughly where you are, your ISP) and its LAN addresses;"
+  Write-Host "  - the node listens on one UDP port. Behind a home router nothing is open"
+  Write-Host "    to the internet: only a user the router sends here gets through, after"
+  Write-Host "    the node opens the way to that user."
+  Write-Host "  Turn it off if you would rather keep this node's addresses private:"
+  Write-Host "  re-run with -ExtraArgs `"--no-client-direct`""
+  Write-Host ""
+  if (-not $ExtraArgs.Contains("--client-direct") -and [Environment]::UserInteractive) {
+    try {
+      $ans = Read-Host "serve remote-client users directly? [Y/n]"
+      if ($ans -match '^[nN]') { $ExtraArgs = ($ExtraArgs + " --no-client-direct").Trim(); Write-Host "direct: off" }
+      else { Write-Host "direct: on" }
+    } catch { Write-Host "direct: on" }
+  }
+}
+
 $modelArgs = ($Models | ForEach-Object { " --model $_" }) -join ""
 if ($ExtraArgs) { $modelArgs += " $ExtraArgs" }
 @"

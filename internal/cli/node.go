@@ -133,6 +133,7 @@ func newStartCommand() *cobra.Command {
 		noReverseQUIC  bool
 		simulateSymNat bool
 		clientDirect   bool
+		noClientDirect bool
 		clientPort     int
 		priceIn        int
 		priceOut       int
@@ -252,10 +253,11 @@ func newStartCommand() *cobra.Command {
 				}, log)
 			// The client listener (direct client→node path): one socket for
 			// the whole node, shared by every router session like the
-			// in-flight counter. Off by default until the field test.
+			// in-flight counter. On by default since v0.1.14 (field test
+			// 3.8); --no-client-direct opts out.
 			var clientListener *ingress.ClientListener
 			var fleetRef atomic.Pointer[ingress.Fleet] // read by the listener's goroutine
-			if clientDirect {
+			if clientDirect && !noClientDirect {
 				cl, err := ingress.StartClientListener(runCtx, ingress.ClientListenerConfig{
 					Identity: priv, Port: clientPort, RouterURLs: routerURLs,
 					AgentVersion: Version, Log: log,
@@ -287,10 +289,17 @@ func newStartCommand() *cobra.Command {
 					},
 				})
 				if err != nil {
-					return fmt.Errorf("--client-direct: %w", err)
+					// On by default now: a listener that cannot start (the
+					// port taken, no UDP) must not take the node down — it
+					// keeps serving through its routers.
+					log.Warn("direct client listener did not start — serving through routers only", "err", err)
+				} else {
+					defer cl.Close()
+					clientListener = cl
+					log.Info("direct client connections are on: remote-client users the router sends here " +
+						"see this node's public and LAN addresses, and the node listens on one UDP port. " +
+						"Run with --no-client-direct to serve them only through a router")
 				}
-				defer cl.Close()
-				clientListener = cl
 			}
 			fleet = ingress.NewFleet(ingress.FleetConfig{
 				Seeds:  routerURLs,
@@ -458,8 +467,10 @@ func newStartCommand() *cobra.Command {
 		"never upgrade to the hole-punched direct QUIC path (stay on the WSS relay)")
 	cmd.Flags().BoolVar(&noReverseQUIC, "no-reverse-quic", false,
 		"never dial the router's public QUIC endpoint for the node-dialed data plane (symmetric-NAT nodes use it to leave the relay)")
-	cmd.Flags().BoolVar(&clientDirect, "client-direct", false,
-		"accept direct QUIC connections from remote-client users (opens one UDP port; this release answers reachability checks only)")
+	cmd.Flags().BoolVar(&clientDirect, "client-direct", true,
+		"serve remote-client users directly over QUIC (on by default): clients the router sends here learn this node's public and LAN addresses, and the node listens on one UDP port — behind a home router only the client the router named gets through, after the node opens the way to it. Turn off with --no-client-direct")
+	cmd.Flags().BoolVar(&noClientDirect, "no-client-direct", false,
+		"never serve remote-client users directly: they reach this node only through a router, which keeps its addresses private and opens no port")
 	cmd.Flags().IntVar(&clientPort, "client-port", 0,
 		"UDP port of the --client-direct listener (0 = any free port; set one you forward on your router for clients behind strict NATs)")
 	cmd.Flags().BoolVar(&simulateSymNat, "simulate-symmetric-nat", false,

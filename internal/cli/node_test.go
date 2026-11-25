@@ -26,3 +26,21 @@ func TestValidateRouterURL(t *testing.T) {
 		}
 	}
 }
+
+// TestClientDirectOnByDefault: since v0.1.14 a node serves remote-client
+// users directly unless its owner opts out with --no-client-direct.
+func TestClientDirectOnByDefault(t *testing.T) {
+	cmd := newStartCommand()
+	on := cmd.Flags().Lookup("client-direct")
+	off := cmd.Flags().Lookup("no-client-direct")
+	if on == nil || on.DefValue != "true" {
+		t.Fatalf("--client-direct default = %v, want true", on)
+	}
+	if off == nil || off.DefValue != "false" {
+		t.Fatalf("--no-client-direct missing or on by default: %v", off)
+	}
+	// Existing service units pass --client-direct explicitly: still accepted.
+	if err := cmd.Flags().Parse([]string{"--client-direct", "--no-client-direct"}); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+}
