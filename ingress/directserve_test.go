@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -36,8 +37,13 @@ type directServeFixture struct {
 	clientTr  *quic.Transport
 	calls     atomic.Int64
 	inflight  atomic.Int64
-	script    func(ctx context.Context, req wire.InferenceRequestData, emit func(wire.InferenceChunkData) error) (wire.InferenceDoneData, error)
-	lastReq   chan wire.InferenceRequestData
+	// script is the backend; tests swap it after the listener started, so
+	// it is read and written under scriptMu (the listener's goroutines
+	// read it — a network round trip is no happens-before to the race
+	// detector).
+	scriptMu sync.Mutex
+	script   func(ctx context.Context, req wire.InferenceRequestData, emit func(wire.InferenceChunkData) error) (wire.InferenceDoneData, error)
+	lastReq  chan wire.InferenceRequestData
 }
 
 func newDirectServeFixture(t *testing.T, home string) *directServeFixture {
@@ -83,11 +89,21 @@ func newDirectServeFixture(t *testing.T, home string) *directServeFixture {
 	return f
 }
 
+// setScript swaps the backend script (safe while the listener runs).
+func (f *directServeFixture) setScript(fn func(ctx context.Context, req wire.InferenceRequestData, emit func(wire.InferenceChunkData) error) (wire.InferenceDoneData, error)) {
+	f.scriptMu.Lock()
+	f.script = fn
+	f.scriptMu.Unlock()
+}
+
 // fixtureHandler adapts the script to InferenceHandler.
 type fixtureHandler struct{ f *directServeFixture }
 
 func (h *fixtureHandler) HandleInference(ctx context.Context, req wire.InferenceRequestData, emit func(wire.InferenceChunkData) error) (wire.InferenceDoneData, error) {
-	return h.f.script(ctx, req, emit)
+	h.f.scriptMu.Lock()
+	fn := h.f.script
+	h.f.scriptMu.Unlock()
+	return fn(ctx, req, emit)
 }
 
 // ticket mints a router-signed ticket for this fixture's node and client.
@@ -279,9 +295,9 @@ func TestDirectServeClampsMaxTokens(t *testing.T) {
 // client's cue to try the next candidate.
 func TestDirectServeBusy(t *testing.T) {
 	f := newDirectServeFixture(t, t.TempDir())
-	f.script = func(ctx context.Context, req wire.InferenceRequestData, emit func(wire.InferenceChunkData) error) (wire.InferenceDoneData, error) {
+	f.setScript(func(ctx context.Context, req wire.InferenceRequestData, emit func(wire.InferenceChunkData) error) (wire.InferenceDoneData, error) {
 		return wire.InferenceDoneData{}, wire.ErrBusy
-	}
+	})
 	f.refusal(t, f.ticket(nil), wire.InferenceRequestData{Model: "qwen3:4b", MaxTokens: 16}, "r-busy", "busy")
 }
 
@@ -291,7 +307,7 @@ func TestDirectRevokeAbortsRunningStream(t *testing.T) {
 	f := newDirectServeFixture(t, t.TempDir())
 	started := make(chan struct{})
 	cancelled := make(chan struct{}, 1)
-	f.script = func(ctx context.Context, req wire.InferenceRequestData, emit func(wire.InferenceChunkData) error) (wire.InferenceDoneData, error) {
+	f.setScript(func(ctx context.Context, req wire.InferenceRequestData, emit func(wire.InferenceChunkData) error) (wire.InferenceDoneData, error) {
 		close(started)
 		select {
 		case <-ctx.Done():
@@ -300,7 +316,7 @@ func TestDirectRevokeAbortsRunningStream(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			return wire.InferenceDoneData{}, nil
 		}
-	}
+	})
 	// Drive the request from its own goroutine: it will not complete.
 	tk := f.ticket(nil)
 	streamErr := make(chan error, 1)
@@ -438,7 +454,7 @@ func queuedReceipts(t *testing.T, home string) []wire.UsageReceipt {
 func TestDirectServeCutOffStillBills(t *testing.T) {
 	home := t.TempDir()
 	f := newDirectServeFixture(t, home)
-	f.script = func(ctx context.Context, req wire.InferenceRequestData, emit func(wire.InferenceChunkData) error) (wire.InferenceDoneData, error) {
+	f.setScript(func(ctx context.Context, req wire.InferenceRequestData, emit func(wire.InferenceChunkData) error) (wire.InferenceDoneData, error) {
 		f.calls.Add(1)
 		for _, c := range []wire.InferenceChunkData{{Content: "one two "}, {Content: "three four "}, {Content: "five"}} {
 			if err := emit(c); err != nil {
@@ -446,7 +462,7 @@ func TestDirectServeCutOffStillBills(t *testing.T) {
 			}
 		}
 		return wire.InferenceDoneData{}, errors.New("backend died mid-answer")
-	}
+	})
 	tk := f.ticket(nil)
 	out := f.directRoundTrip(tk, wire.InferenceRequestData{Model: "qwen3:4b",
 		Messages: []wire.InferenceMessage{{Role: "user", Content: "hi"}}, MaxTokens: 16}, "req-cut")
@@ -472,10 +488,10 @@ func TestDirectServeCutOffStillBills(t *testing.T) {
 func TestDirectServePreTokenFailureNoReceipt(t *testing.T) {
 	home := t.TempDir()
 	f := newDirectServeFixture(t, home)
-	f.script = func(ctx context.Context, req wire.InferenceRequestData, emit func(wire.InferenceChunkData) error) (wire.InferenceDoneData, error) {
+	f.setScript(func(ctx context.Context, req wire.InferenceRequestData, emit func(wire.InferenceChunkData) error) (wire.InferenceDoneData, error) {
 		f.calls.Add(1)
 		return wire.InferenceDoneData{}, errors.New("backend down")
-	}
+	})
 	tk := f.ticket(nil)
 	_ = f.directRoundTrip(tk, wire.InferenceRequestData{Model: "qwen3:4b", MaxTokens: 16}, "req-pre")
 	if recs := queuedReceipts(t, home); len(recs) != 0 {
