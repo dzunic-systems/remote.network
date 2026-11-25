@@ -103,7 +103,10 @@ func VerifyTicket(t Ticket, rootPub ed25519.PublicKey, nodeID string, now time.T
 	if t.V != TicketVersion {
 		return fmt.Errorf("%w: v%d", ErrTicketVersion, t.V)
 	}
-	if t.ID == "" || t.ClientPub == "" || t.NotAfter <= t.NotBefore {
+	// A ticket must bound its output: a non-positive cap would read as "no
+	// cap" to a backend, and settlement bills at most the cap — unbounded
+	// work for nothing. Routers never issue one; nodes refuse one.
+	if t.ID == "" || t.ClientPub == "" || t.NotAfter <= t.NotBefore || t.MaxTokens <= 0 {
 		return ErrTicketMalformed
 	}
 	routerPub, certRoot, err := identity.VerifyRouterCert(t.RouterCert)

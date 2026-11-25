@@ -54,10 +54,15 @@ const (
 	TypePunchReport   = "punch.report"   // node→router: NAT class + candidacy
 
 	// Direct client→node path (node v0.1.11+).
-	TypeDirectOffer = "direct.offer" // router→node: a client is about to dial — open the NAT toward it
+	TypeDirectOffer  = "direct.offer"  // router→node: a client is about to dial — open the NAT toward it
+	TypeDirectRevoke = "direct.revoke" // router→node: these tickets are dead — refuse and abort
 	// On a client-listener stream (client↔node, never the router channel):
-	TypeDirectPing = "direct.ping" // client→node: reachability check
-	TypeDirectPong = "direct.pong" // node→client: who answered
+	TypeDirectPing    = "direct.ping"    // client→node: reachability check
+	TypeDirectPong    = "direct.pong"    // node→client: who answered
+	TypeDirectRequest = "direct.request" // client→node: a ticketed inference request
+	// Over the node's WSS control channel:
+	TypeUsageReceipt    = "usage.receipt"     // node→router: the direct path's signed bill
+	TypeUsageReceiptAck = "usage.receipt_ack" // router→node: recorded — the node may delete its copy
 )
 
 // DirectPongData answers a direct.ping on a client-listener stream.
@@ -94,6 +99,20 @@ type DirectOfferData struct {
 	ClientPub   string   `json:"client_pub"`          // the key the client's TLS certificate will carry
 	ClientAddrs []string `json:"client_addrs"`        // its router-observed public address, then LAN addresses
 	NotAfter    int64    `json:"not_after"`           // unix seconds; a stale offer is ignored
+}
+
+// DirectRevokeData kills tickets on the node: refuse new streams carrying
+// them and abort any running one (suspension, key revocation, key limit).
+// A push lost to a dead session is bounded by the ticket's lifetime.
+type DirectRevokeData struct {
+	TicketIDs []string `json:"ticket_ids"`
+}
+
+// UsageReceiptAck names the receipts a router recorded — the node may
+// delete its queued copies.
+type UsageReceiptAck struct {
+	TicketID  string `json:"ticket_id"`
+	RequestID string `json:"request_id"`
 }
 
 // Envelope is the outer wire format for every message in both directions.

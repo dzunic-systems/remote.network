@@ -303,6 +303,22 @@ func (f *Fleet) Clients() map[string]*Client {
 	return out
 }
 
+// ClientForRouter returns the attached client whose session has proved
+// routerID ("" = none). The direct path's receipts go to the ticket's
+// router first — the router that issued the ticket is the one whose
+// exposure cap holds the reservation.
+func (f *Fleet) ClientForRouter(routerID string) *Client {
+	if routerID == "" {
+		return nil
+	}
+	for _, c := range f.Clients() {
+		if c.ConnectionState().Connected && c.RouterID() == routerID {
+			return c
+		}
+	}
+	return nil
+}
+
 // ConnStates snapshots every attached client's connection line for
 // live.json.
 func (f *Fleet) ConnStates() []ConnState {

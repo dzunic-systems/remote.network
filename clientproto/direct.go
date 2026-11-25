@@ -118,6 +118,27 @@ func DialNode(ctx context.Context, tr *quic.Transport, endpoints []string, clien
 	return nil, fmt.Errorf("%w: %s", ErrNoDirectPath, strings.Join(errs, "; "))
 }
 
+// DirectRequestData is the first envelope on a direct stream: the
+// router-signed ticket, the client's request id (what the receipt and the
+// ledger key by), and the inference request itself (its Model must equal
+// the ticket's ModelID — the node-side id the router put in the ticket).
+// The type constant lives on the wire (wire cannot import clientproto).
+type DirectRequestData struct {
+	Ticket    Ticket                    `json:"ticket"`
+	RequestID string                    `json:"request_id"`
+	Request   wire.InferenceRequestData `json:"request"`
+}
+
+// SendDirectRequest writes the request envelope and returns the stream
+// for reading the node's chunk/done/error envelopes.
+func SendDirectRequest(stream deadlineWriter, d DirectRequestData, wait time.Duration) error {
+	env, err := wire.New(wire.TypeDirectRequest, "", d)
+	if err != nil {
+		return err
+	}
+	return WriteEnvelope(stream, env, wait)
+}
+
 // Ping opens a stream, sends direct.ping and reads the node's answer.
 func Ping(ctx context.Context, conn *quic.Conn) (wire.DirectPongData, error) {
 	stream, err := conn.OpenStreamSync(ctx)

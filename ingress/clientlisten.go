@@ -18,6 +18,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -59,7 +61,34 @@ type ClientListenerConfig struct {
 	HTTPClient *http.Client
 	// LANAddrs overrides the machine's LAN address discovery (tests).
 	LANAddrs func() []net.IP
+	// Handler, when set, is the inference core the listener serves
+	// direct requests with (the same handler the relayed planes use).
+	// nil = the listener only completes handshakes and answers pings —
+	// reachability without serving (the heartbeat then reports Serving
+	// false, and the router routes direct traffic elsewhere).
+	Handler InferenceHandler
+	// RouterRoot is the company root public key the listener verifies
+	// tickets against (--router-root, base32); empty falls back to the
+	// HomeDir's persisted root pin. Neither present = the listener
+	// cannot verify a ticket chain, so it serves nothing direct.
+	RouterRoot string
+	// HomeDir is ~/.remote: the root pin file lives there, and the
+	// receipt queue directory is created under it.
+	HomeDir string
+	// NodeInFlight is the NODE-wide dispatch counter the listener's
+	// direct requests count into (shared with every fleet client, so
+	// every router's load view includes them). Nil = legacy: only this
+	// listener counts.
+	NodeInFlight *atomic.Int64
+	// Fleet returns the live fleet (for the receipt sink: the ticket's
+	// router's session, else any connected one). Nil = receipts queue
+	// until one is set.
+	Fleet func() *Fleet
 }
+
+// serving reports whether this listener answers direct.request streams:
+// the heartbeat's Serving fact, the router's only candidate filter.
+func (l *ClientListener) serving() bool { return l.cfg.Handler != nil }
 
 // ClientListener is the running listener.
 type ClientListener struct {
@@ -74,6 +103,17 @@ type ClientListener struct {
 
 	info   atomic.Pointer[wire.DirectClientInfo]
 	offers atomic.Int64
+	core   *serveCore
+	queue  *receiptStore
+
+	directInFlight atomic.Int64
+
+	revMu   sync.Mutex
+	revoked map[string]time.Time // ticket id → drop after
+	liveMu  sync.Mutex
+	live    map[string][]context.CancelFunc // ticket id → running streams
+	usedMu  sync.Mutex
+	used    map[string]time.Time // used ticket id → keep until
 
 	mu         sync.Mutex
 	conns      int
@@ -109,6 +149,7 @@ func StartClientListener(ctx context.Context, cfg ClientListenerConfig) (*Client
 		perIP:  map[string]int{},
 
 		routerInfo: map[string]routerUDP{},
+		live:       map[string][]context.CancelFunc{},
 	}
 	l.tr = &quic.Transport{
 		Conn: sock,
@@ -127,12 +168,124 @@ func StartClientListener(ctx context.Context, cfg ClientListenerConfig) (*Client
 		_, err := l.tr.WriteTo(b, to)
 		return err
 	})
+	if cfg.Handler != nil {
+		l.core = &serveCore{
+			handler:      cfg.Handler,
+			identity:     cfg.Identity,
+			log:          l.log,
+			connInFlight: &l.directInFlight,
+			nodeInFlight: cfg.NodeInFlight,
+		}
+		l.queue = newReceiptStore(filepath.Join(cfg.HomeDir, "receipts"), l.log, l.sendReceipt)
+		go l.queue.run(ctx)
+		if err := os.MkdirAll(l.queue.dir, 0o700); err == nil {
+			l.queue.sweep(ctx) // boot: deliver what the last run queued
+		}
+	}
 	ctx, l.cancel = context.WithCancel(ctx)
 	go l.readDatagrams(ctx)
 	go l.accept(ctx)
 	go l.keepalive(ctx)
-	l.log.Info("client listener up", "addr", sock.LocalAddr().String())
+	l.log.Info("client listener up", "addr", sock.LocalAddr().String(),
+		"serving", l.serving())
 	return l, nil
+}
+
+// directInFlight is the listener's own dispatch count (Drain's deadline
+// waits on the fleet clients' counts; direct requests count node-wide
+// through cfg.NodeInFlight).
+// sendReceipt delivers one receipt to a router: the ticket's router's
+// fleet session first, else any connected one (they share the spine; the
+// receipts PK dedupes).
+func (l *ClientListener) sendReceipt(routerID string, env wire.Envelope) bool {
+	f := l.cfg.Fleet
+	if f == nil {
+		return false
+	}
+	fleet := f()
+	if fleet == nil {
+		return false
+	}
+	if routerID != "" {
+		if c := fleet.ClientForRouter(routerID); c != nil && c.sendRaw(wire.TypeUsageReceipt, env.NodeID, env.Data) == nil {
+			return true
+		}
+	}
+	for _, c := range fleet.Clients() {
+		if c.sendRaw(wire.TypeUsageReceipt, env.NodeID, env.Data) == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// AckReceipt records a router's usage.receipt_ack: the queued copy may go.
+func (l *ClientListener) AckReceipt(ticketID, requestID string) {
+	if l.queue != nil {
+		l.queue.noteAcked(ticketID, requestID)
+	}
+}
+
+// Revoke kills tickets: refuse new streams carrying them and abort any
+// running one. Entries age out past the ticket lifetime + skew — the
+// lifetime bounds the whole set.
+func (l *ClientListener) Revoke(ticketIDs []string) {
+	drop := time.Now().Add(clientproto.TicketLifetime + 2*clientproto.TicketSkew)
+	l.revMu.Lock()
+	if l.revoked == nil {
+		l.revoked = map[string]time.Time{}
+	}
+	for _, id := range ticketIDs {
+		l.revoked[id] = drop
+	}
+	l.revMu.Unlock()
+	for _, id := range ticketIDs {
+		l.liveMu.Lock()
+		cancels := l.live[id]
+		delete(l.live, id)
+		l.liveMu.Unlock()
+		for _, cancel := range cancels {
+			cancel() // the running stream dies; the client falls back
+		}
+	}
+	l.log.Info("direct tickets revoked", "tickets", len(ticketIDs))
+}
+
+// revokedNow reports whether a ticket id is on the revocation set.
+func (l *ClientListener) revokedNow(ticketID string) bool {
+	l.revMu.Lock()
+	defer l.revMu.Unlock()
+	drop, ok := l.revoked[ticketID]
+	if ok && time.Now().After(drop) {
+		delete(l.revoked, ticketID)
+		return false
+	}
+	return ok
+}
+
+// noteTicketUsed records a spent ticket (one request per ticket in v1);
+// a second use before its expiry+skew is refused.
+func (l *ClientListener) noteTicketUsed(t clientproto.Ticket) bool {
+	until := time.Unix(t.NotAfter, 0).Add(clientproto.TicketSkew)
+	l.usedMu.Lock()
+	defer l.usedMu.Unlock()
+	if l.used == nil {
+		l.used = map[string]time.Time{}
+	}
+	now := time.Now()
+	if deadline, seen := l.used[t.ID]; seen && now.Before(deadline) {
+		return false
+	}
+	// prune occasionally
+	if len(l.used) > 1024 {
+		for id, deadline := range l.used {
+			if now.After(deadline) {
+				delete(l.used, id)
+			}
+		}
+	}
+	l.used[t.ID] = until
+	return true
 }
 
 // Close stops the listener.
@@ -212,9 +365,10 @@ func (l *ClientListener) accept(ctx context.Context) {
 	}
 }
 
-// serveConn answers a direct connection's streams. For now: direct.ping
-// gets a pong; anything else is told the node does not serve direct
-// requests yet.
+// serveConn answers a direct connection's streams: direct.ping gets a
+// pong, direct.request runs the ticket checks and the shared serving
+// core, anything else is refused. The TLS peer key is bound to the
+// connection — every stream on it carries the same identity.
 func (l *ClientListener) serveConn(conn *quic.Conn) {
 	peer, _ := identity.PeerIdentity(conn.ConnectionState().TLS)
 	l.log.Debug("direct connection", "remote", conn.RemoteAddr().String(), "client", peer)
@@ -224,11 +378,14 @@ func (l *ClientListener) serveConn(conn *quic.Conn) {
 		if err != nil {
 			return
 		}
-		go l.serveStream(stream)
+		go l.serveStream(stream, peer)
 	}
 }
 
-func (l *ClientListener) serveStream(stream *quic.Stream) {
+// serveStream handles one stream. The 10 s read deadline covers the
+// request envelope; the serving path clears it — a stream's life is the
+// request's (the client's own read deadline governs the answer).
+func (l *ClientListener) serveStream(stream *quic.Stream, peer string) {
 	defer stream.Close()
 	_ = stream.SetReadDeadline(time.Now().Add(10 * time.Second))
 	sc := clientproto.NewEnvelopeScanner(stream)
@@ -239,21 +396,159 @@ func (l *ClientListener) serveStream(stream *quic.Stream) {
 	if json.Unmarshal(sc.Bytes(), &env) != nil {
 		return
 	}
-	var reply wire.Envelope
-	var err error
 	switch env.Type {
 	case wire.TypeDirectPing:
-		reply, err = wire.New(wire.TypeDirectPong, l.nodeID, wire.DirectPongData{
-			NodeID: l.nodeID, AgentVersion: l.cfg.AgentVersion, Serving: false,
+		reply, err := wire.New(wire.TypeDirectPong, l.nodeID, wire.DirectPongData{
+			NodeID: l.nodeID, AgentVersion: l.cfg.AgentVersion, Serving: l.serving(),
 		})
+		if err == nil {
+			_ = clientproto.WriteEnvelope(stream, reply, writeWait)
+		}
+		return
+	case wire.TypeDirectRequest:
+		l.serveDirectRequest(stream, peer, env)
 	default:
-		reply, err = wire.NewReq(wire.TypeInferenceError, l.nodeID, env.ReqID, wire.ErrorData{
-			Code: "direct_not_serving", Message: "this node accepts direct connections but does not serve direct requests yet",
+		reply, err := wire.NewReq(wire.TypeInferenceError, l.nodeID, env.ReqID, wire.ErrorData{
+			Code: "direct_not_serving", Message: "this node accepts direct connections but does not serve this",
 		})
+		if err == nil {
+			_ = clientproto.WriteEnvelope(stream, reply, writeWait)
+		}
+	}
+}
+
+// serveDirectRequest runs one ticketed request: the checks, in order,
+// each refusing with a stable code before any backend work; then the
+// shared serving core streams the answer, the receipt carries the ticket
+// id, and the queue walks it to a router.
+func (l *ClientListener) serveDirectRequest(stream *quic.Stream, peer string, env wire.Envelope) {
+	refuse := func(reqID, code, message string) {
+		reply, err := wire.NewReq(wire.TypeInferenceError, l.nodeID, reqID,
+			wire.ErrorData{Code: code, Message: message})
+		if err == nil {
+			_ = clientproto.WriteEnvelope(stream, reply, writeWait)
+		}
+	}
+	if l.core == nil {
+		refuse(env.ReqID, "direct_not_serving", "this node accepts direct connections but does not serve direct requests")
+		return
+	}
+	var d clientproto.DirectRequestData
+	if err := json.Unmarshal(env.Data, &d); err != nil || d.RequestID == "" {
+		refuse(env.ReqID, "ticket_invalid", "malformed direct request")
+		return
+	}
+	t := d.Ticket
+	// The chain: pinned root → router certificate → ticket, for THIS node,
+	// within the validity window.
+	root, ok := l.rootPub()
+	if !ok {
+		refuse(d.RequestID, "ticket_invalid", "this node has no company root pinned — it cannot verify tickets")
+		return
+	}
+	if err := clientproto.VerifyTicket(t, root, l.nodeID, time.Now()); err != nil {
+		code := "ticket_invalid"
+		if errors.Is(err, clientproto.ErrTicketExpired) {
+			code = "ticket_expired"
+		}
+		l.log.Info("direct request refused", "request_id", d.RequestID, "code", code, "err", err)
+		refuse(d.RequestID, code, "ticket refused: "+err.Error())
+		return
+	}
+	// The TLS peer IS the ticket's client: the key the router bound to
+	// this permission must be the key on this connection.
+	if t.ClientPub != peer {
+		refuse(d.RequestID, "ticket_client", "ticket was issued to another client key")
+		return
+	}
+	// The request asks for the ticket's model, nothing else.
+	if d.Request.Model != t.ModelID {
+		refuse(d.RequestID, "ticket_model",
+			fmt.Sprintf("ticket is for model %q, request names %q", t.ModelID, d.Request.Model))
+		return
+	}
+	// One request per ticket.
+	if !l.noteTicketUsed(t) {
+		refuse(d.RequestID, "ticket_used", "ticket was already used")
+		return
+	}
+	// Not revoked (the router's push; the lifetime bounds a lost push).
+	if l.revokedNow(t.ID) {
+		refuse(d.RequestID, "ticket_revoked", "ticket was revoked")
+		return
+	}
+	// The ticket's output cap is what the reservation covered: the
+	// request's ask (or a default) never exceeds it.
+	if t.MaxTokens > 0 && (d.Request.MaxTokens <= 0 || d.Request.MaxTokens > t.MaxTokens) {
+		d.Request.MaxTokens = t.MaxTokens
+	}
+	// The stream's life is the request's; a revoke cancels it mid-flight.
+	sctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	l.liveMu.Lock()
+	l.live[t.ID] = append(l.live[t.ID], cancel)
+	l.liveMu.Unlock()
+	defer func() {
+		l.liveMu.Lock()
+		delete(l.live, t.ID)
+		l.liveMu.Unlock()
+	}()
+
+	_ = stream.SetReadDeadline(time.Time{}) // the answer now governs
+	start := time.Now()
+	done, code, err := l.core.run(sctx, d.RequestID, d.Request, func(chunk wire.InferenceChunkData) error {
+		reply, werr := wire.NewReq(wire.TypeInferenceChunk, l.nodeID, d.RequestID, chunk)
+		if werr != nil {
+			return werr
+		}
+		return clientproto.WriteEnvelope(stream, reply, writeWait)
+	}, t.ID)
+	// The receipt is queued (on disk) BEFORE the consumer hears the end:
+	// the answer is out, and the record that bills it must not depend on
+	// this process surviving the next write. A request cut off after
+	// output carries a failed_mid_stream receipt (serveCore.run).
+	if done.Receipt != nil {
+		l.queue.enqueue(*done.Receipt, t.RouterID)
+	}
+	if code != "" {
+		msg := ""
+		if err != nil {
+			msg = err.Error()
+		}
+		refuse(d.RequestID, code, msg)
+		return
 	}
 	if err == nil {
-		_ = clientproto.WriteEnvelope(stream, reply, writeWait)
+		reply, werr := wire.NewReq(wire.TypeInferenceDone, l.nodeID, d.RequestID, done)
+		if werr == nil {
+			werr = clientproto.WriteEnvelope(stream, reply, writeWait)
+		}
+		if werr != nil {
+			l.log.Warn("direct answer write failed", "request_id", d.RequestID, "err", werr)
+		}
 	}
+	l.log.Info("direct request served", "request_id", d.RequestID, "model", d.Request.Model,
+		"ticket", t.ID, "ms", time.Since(start).Milliseconds())
+}
+
+// rootPub is the company root this listener verifies ticket chains
+// against: the explicit flag, else the persisted pin (the same pin the
+// WSS handshake TOFU'd).
+func (l *ClientListener) rootPub() (ed25519.PublicKey, bool) {
+	want := l.cfg.RouterRoot
+	if want == "" && l.cfg.HomeDir != "" {
+		if b, err := os.ReadFile(filepath.Join(l.cfg.HomeDir, routerRootPin)); err == nil {
+			want = strings.TrimSpace(string(b))
+		}
+	}
+	if want == "" {
+		return nil, false
+	}
+	pub, err := identity.PubFromString(want)
+	if err != nil {
+		return nil, false
+	}
+	return pub, true
 }
 
 // keepalive runs an observe round now and every clientKeepalive: it keeps
@@ -306,7 +601,8 @@ func (l *ClientListener) observeOnce(ctx context.Context) {
 		}
 	}
 	prev := l.info.Load()
-	l.info.Store(&wire.DirectClientInfo{Endpoints: endpoints, NAT: obs.NAT, MaxConns: clientMaxConns})
+	l.info.Store(&wire.DirectClientInfo{Endpoints: endpoints, NAT: obs.NAT, MaxConns: clientMaxConns,
+		Serving: l.serving()})
 	if prev == nil || prev.Endpoints[0] != obs.Main || prev.NAT != obs.NAT {
 		l.log.Info("client listener reachable", "public", obs.Main, "nat", obs.NAT,
 			"candidate", obs.Candidate, "tested_against", mapping)

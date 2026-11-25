@@ -116,7 +116,7 @@ func TestTicketVerify(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	foreign, err := SignTicket(f.routerKey, foreignCert, Ticket{ID: "x", NodeID: f.nodeID, ClientPub: "c", NotBefore: f.now.Unix(), NotAfter: f.now.Unix() + 60})
+	foreign, err := SignTicket(f.routerKey, foreignCert, Ticket{ID: "x", NodeID: f.nodeID, ClientPub: "c", MaxTokens: 1, NotBefore: f.now.Unix(), NotAfter: f.now.Unix() + 60})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,6 +140,7 @@ func TestTicketVerify(t *testing.T) {
 		{"within skew before start", good, f.nodeID, f.now.Add(-TicketSkew + time.Second), nil},
 		{"newer version", func() Ticket { x := good; x.V = TicketVersion + 1; return x }(), f.nodeID, f.now, ErrTicketVersion},
 		{"no client key", f.ticket(t, func(x *Ticket) { x.ClientPub = "" }), f.nodeID, f.now, ErrTicketMalformed},
+		{"no output cap", f.ticket(t, func(x *Ticket) { x.MaxTokens = 0 }), f.nodeID, f.now, ErrTicketMalformed},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			err := VerifyTicket(c.tk, f.rootPub, c.node, c.at)

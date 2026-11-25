@@ -259,6 +259,17 @@ func newStartCommand() *cobra.Command {
 				cl, err := ingress.StartClientListener(runCtx, ingress.ClientListenerConfig{
 					Identity: priv, Port: clientPort, RouterURLs: routerURLs,
 					AgentVersion: Version, Log: log,
+					// Serving: the same handler the relayed planes use, the
+					// node-wide in-flight counter (direct requests show in
+					// every router's load view), the pinned root for ticket
+					// verification, and the fleet for receipt delivery.
+					Handler:      handler,
+					RouterRoot:   routerRoot,
+					HomeDir:      homeDir,
+					NodeInFlight: nodeInFlight,
+					Fleet: func() *ingress.Fleet {
+						return fleetRef.Load()
+					},
 					// The fleet's attached routers: the NAT test needs a second
 					// router on another IP. The fleet is built just below; until
 					// then the seeds alone are asked.

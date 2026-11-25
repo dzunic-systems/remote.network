@@ -19,7 +19,6 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"remote.network/node/clientproto"
 	"remote.network/node/identity"
 	"remote.network/node/wire"
 )
@@ -139,6 +138,9 @@ type Client struct {
 	curConn  *websocket.Conn // live session socket (guarded by sendMu)
 	inFlight atomic.Int64
 	cancels  sync.Map // req_id → context.CancelFunc for live dispatches
+
+	coreOnce sync.Once
+	coreRef  *serveCore
 
 	reprobeMu   sync.Mutex
 	lastReprobe time.Time
@@ -409,6 +411,18 @@ func (c *Client) readLoop(ctx context.Context, conn *websocket.Conn, nodeID stri
 				continue
 			}
 			c.cfg.DirectClient.Offer(d)
+		case wire.TypeDirectRevoke:
+			var d wire.DirectRevokeData
+			if c.cfg.DirectClient == nil || json.Unmarshal(env.Data, &d) != nil {
+				continue
+			}
+			c.cfg.DirectClient.Revoke(d.TicketIDs)
+		case wire.TypeUsageReceiptAck:
+			var d wire.UsageReceiptAck
+			if c.cfg.DirectClient == nil || json.Unmarshal(env.Data, &d) != nil {
+				continue
+			}
+			c.cfg.DirectClient.AckReceipt(d.TicketID, d.RequestID)
 		case wire.TypePunchBegin:
 			var d wire.PunchBeginData
 			if err := json.Unmarshal(env.Data, &d); err != nil {
@@ -546,62 +560,11 @@ func (c *Client) handleReprobe(d wire.ReprobeData) {
 	}
 }
 
-// runHandler is the shared request core for both data planes (WSS relay and
-// direct QUIC): concurrency slot, handler invocation, busy mapping. The
-// non-empty code return means "terminal error with that wire code".
+// runHandler is the relayed planes' entry into the shared serving core
+// (servecore.go — the client listener calls the core directly, with a
+// ticket id on its receipts).
 func (c *Client) runHandler(ctx context.Context, reqID string, req wire.InferenceRequestData, emit func(wire.InferenceChunkData) error) (done wire.InferenceDoneData, code string, err error) {
-	if c.cfg.Handler == nil {
-		return wire.InferenceDoneData{}, "no_handler", errors.New("node agent has no serving backend")
-	}
-	c.acquireInflight()
-	defer c.releaseInflight()
-
-	start := time.Now()
-	var firstChunk time.Time
-	timed := func(chunk wire.InferenceChunkData) error {
-		if firstChunk.IsZero() {
-			firstChunk = time.Now()
-		}
-		return emit(chunk)
-	}
-	done, err = c.cfg.Handler.HandleInference(ctx, req, timed)
-	if err != nil {
-		code = "backend_error"
-		if errors.Is(err, wire.ErrBusy) {
-			code = "busy"
-		}
-		c.log.Warn("inference failed", "req_id", reqID, "model", req.Model, "code", code, "err", err)
-		return done, code, err
-	}
-	done.Receipt = c.signReceipt(reqID, req.Model, done, start, firstChunk)
-	return done, code, err
-}
-
-// signReceipt is the node's signed account of a served request
-// riding on inference.done. Every data plane
-// (relay, router QUIC, later the client listener) goes through runHandler,
-// so every completed request carries one. A signing failure never fails
-// the request — the router still has its own count.
-func (c *Client) signReceipt(reqID, model string, done wire.InferenceDoneData, start, firstChunk time.Time) *wire.UsageReceipt {
-	if c.cfg.Identity == nil {
-		return nil
-	}
-	end := time.Now()
-	ttft := 0
-	if !firstChunk.IsZero() {
-		ttft = int(firstChunk.Sub(start).Milliseconds())
-	}
-	r, err := clientproto.SignReceipt(c.cfg.Identity, wire.UsageReceipt{
-		RequestID: reqID, ModelID: model,
-		InputTokens: done.InputTokens, OutputTokens: done.OutputTokens,
-		CachedTokens: done.CachedTokens, ReasoningTokens: done.ReasoningTokens,
-		Status: "ok", TTFTms: ttft, TotalMs: int(end.Sub(start).Milliseconds()), At: end.Unix(),
-	})
-	if err != nil {
-		c.log.Warn("receipt signing failed", "req_id", reqID, "err", err)
-		return nil
-	}
-	return &r
+	return c.core().run(ctx, reqID, req, emit, "")
 }
 
 func (c *Client) heartbeatLoop(ctx context.Context, conn *websocket.Conn, nodeID string, interval time.Duration) {
