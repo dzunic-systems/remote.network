@@ -78,6 +78,9 @@ type oaShowResponse struct {
 		Families []string `json:"families"`
 	} `json:"details"`
 	ModelInfo map[string]any `json:"model_info"`
+	// Template is the model's chat template (Go text/template): it says
+	// whether thinking can be switched off at all (alwaysThinks).
+	Template string `json:"template"`
 }
 
 // oaTagsResponse: Ollama's /api/tags — the only public source of on-disk
@@ -158,6 +161,14 @@ func (c *openaiClient) probeShow(ctx context.Context, model string) (Meta, error
 		Family:       show.Family,
 		Quant:        show.Quantization,
 		Capabilities: show.Capabilities,
+	}
+	if alwaysThinks(show.Capabilities, show.Template) {
+		c.mu.Lock()
+		if c.alwaysThinking == nil {
+			c.alwaysThinking = map[string]bool{}
+		}
+		c.alwaysThinking[model] = true
+		c.mu.Unlock()
 	}
 	if meta.Family == "" && len(show.Details.Families) > 0 {
 		meta.Family = show.Details.Families[0]
@@ -355,3 +366,31 @@ func ModalityOf(raw string, meta Meta) string {
 // derives pin tags with the same function, so the three sides — node
 // naming, router resolution, consumer addressing — cannot drift.
 func RawTag(raw string) string { return wire.RawTag(raw) }
+
+// thinkSwitch matches a template reading Ollama's think switch (.Think —
+// not .IsThinkSet, which only says whether the request named it, and not
+// .ThinkLevel, a level with no "off").
+var thinkSwitch = regexp.MustCompile(`\.Think\b`)
+
+// alwaysThinks reports an Ollama model that thinks whatever the request
+// says: it has the thinking capability, but its template never reads the
+// think switch — so think:false / reasoning_effort "none" change nothing
+// in the prompt, and only make Ollama stop separating the thinking from
+// the answer (the thinking then lands in the answer text). Measured
+// 2026-11-26: qwen3:4b (the 2507 thinking edition) opens <think>
+// unconditionally; the hybrid qwen3:1.7b writes an empty <think></think>
+// when $.Think is false. qwen3.5:4b's stub template renders in Ollama's
+// own code and honours think:false, so a template that never writes
+// <think> proves nothing either way.
+func alwaysThinks(capabilities []string, template string) bool {
+	thinking := false
+	for _, c := range capabilities {
+		if c == "thinking" {
+			thinking = true
+		}
+	}
+	// The template must itself open the thinking block: a stub template
+	// (qwen3.5's is 13 characters) means Ollama renders the prompt in its
+	// own code, which may well honour think:false — it did for qwen3.5:4b.
+	return thinking && strings.Contains(template, "<think>") && !thinkSwitch.MatchString(template)
+}

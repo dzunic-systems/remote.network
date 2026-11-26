@@ -181,6 +181,12 @@ func (c *openaiClient) reasoningOptionsFor(model string) reasoningOptions {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// A model that cannot stop thinking is never asked to: "off" would
+	// only move its thinking into the answer text. Its nearest level
+	// (the ladder's lowest) keeps the thinking where clients expect it.
+	if c.alwaysThinking[model] {
+		return reasoningOptions{noOff: true}
+	}
 	if options, ok := c.nativeOptions[model]; ok {
 		o := reasoningOptions{listed: true, levels: options, noOff: true}
 		for _, l := range options {

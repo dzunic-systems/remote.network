@@ -55,7 +55,10 @@ type openaiClient struct {
 
 	// LM Studio's /api/v1/models: per-model reasoning options, guarded by mu.
 	nativeOptions map[string][]string
-	nativeDone    bool
+	// alwaysThinking: Ollama models whose template cannot switch thinking
+	// off (probe.go alwaysThinks) — "off" is never sent to them.
+	alwaysThinking map[string]bool
+	nativeDone     bool
 
 	// Capability-probe state (caps.go): per-model 1-token probe results,
 	// lazily initialized. Its own mutex; allocated on first use.
