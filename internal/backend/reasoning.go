@@ -179,6 +179,7 @@ func (c *openaiClient) reasoningOptionsFor(model string) reasoningOptions {
 	if !nativeDone {
 		c.loadNativeOptions()
 	}
+	c.checkThinking(model) // once per model; a cached card skipped the probe
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	// A model that cannot stop thinking is never asked to: "off" would

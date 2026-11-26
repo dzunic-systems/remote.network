@@ -96,3 +96,49 @@ func TestAlwaysThinkingModelNeverAskedOff(t *testing.T) {
 		t.Fatalf("reasoning_effort = %v, want low (the nearest level; never none)", r.ReasoningEffort)
 	}
 }
+
+// TestAlwaysThinkingCachedCard (field, v0.1.16): a node whose card came
+// from cache never runs the card probe — the template is read on the
+// first request with a thinking control instead, once per model.
+func TestAlwaysThinkingCachedCard(t *testing.T) {
+	var mu sync.Mutex
+	var seen []offRequest
+	shows := 0
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/show", func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		shows++
+		mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"capabilities": []string{"completion", "thinking"},
+			"template":     tmplThinkingOnly,
+		})
+	})
+	mux.HandleFunc("POST /v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+		var req offRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		mu.Lock()
+		seen = append(seen, req)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	c := capsClient(t, srv.URL) // no ProbeMeta: the cached-card path
+	for i := 0; i < 2; i++ {
+		if _, err := streamEffort(t, c, "off"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if shows != 1 {
+		t.Fatalf("/api/show called %d times, want once per model", shows)
+	}
+	for i, r := range seen {
+		if len(r.ChatTemplateKwargs) != 0 || r.ReasoningEffort == nil || *r.ReasoningEffort != "low" {
+			t.Fatalf("request %d = %+v, want reasoning_effort low and no enable_thinking", i, r)
+		}
+	}
+}

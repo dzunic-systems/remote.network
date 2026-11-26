@@ -58,7 +58,11 @@ type openaiClient struct {
 	// alwaysThinking: Ollama models whose template cannot switch thinking
 	// off (probe.go alwaysThinks) — "off" is never sent to them.
 	alwaysThinking map[string]bool
-	nativeDone     bool
+	// thinkChecked: models whose template was read for alwaysThinking (by
+	// the card probe, or on the first request with a thinking control — a
+	// cached card skips the probe).
+	thinkChecked map[string]bool
+	nativeDone   bool
 
 	// Capability-probe state (caps.go): per-model 1-token probe results,
 	// lazily initialized. Its own mutex; allocated on first use.

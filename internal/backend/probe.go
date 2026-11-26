@@ -162,14 +162,7 @@ func (c *openaiClient) probeShow(ctx context.Context, model string) (Meta, error
 		Quant:        show.Quantization,
 		Capabilities: show.Capabilities,
 	}
-	if alwaysThinks(show.Capabilities, show.Template) {
-		c.mu.Lock()
-		if c.alwaysThinking == nil {
-			c.alwaysThinking = map[string]bool{}
-		}
-		c.alwaysThinking[model] = true
-		c.mu.Unlock()
-	}
+	c.noteThinking(model, alwaysThinks(show.Capabilities, show.Template))
 	if meta.Family == "" && len(show.Details.Families) > 0 {
 		meta.Family = show.Details.Families[0]
 	}
@@ -393,4 +386,57 @@ func alwaysThinks(capabilities []string, template string) bool {
 	// (qwen3.5's is 13 characters) means Ollama renders the prompt in its
 	// own code, which may well honour think:false — it did for qwen3.5:4b.
 	return thinking && strings.Contains(template, "<think>") && !thinkSwitch.MatchString(template)
+}
+
+// noteThinking records one model's alwaysThinks verdict.
+func (c *openaiClient) noteThinking(model string, always bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.alwaysThinking == nil {
+		c.alwaysThinking = map[string]bool{}
+		c.thinkChecked = map[string]bool{}
+	}
+	c.thinkChecked[model] = true
+	if always {
+		c.alwaysThinking[model] = true
+	}
+}
+
+// checkThinking reads one model's template from /api/show once, for a
+// node whose card came from cache (the card probe that would have read it
+// was skipped). Not Ollama (404), or any definite answer: recorded, never
+// asked again. A transport error records nothing, so the next request
+// retries.
+func (c *openaiClient) checkThinking(model string) {
+	c.mu.Lock()
+	done := c.thinkChecked[model]
+	c.mu.Unlock()
+	if done {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), metaTimeout)
+	defer cancel()
+	body, _ := json.Marshal(oaShowRequest{Model: model})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.cfg.BaseURL+"/api/show", strings.NewReader(string(body)))
+	if err != nil {
+		return
+	}
+	c.auth(req)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode < 500 {
+			c.noteThinking(model, false)
+		}
+		return
+	}
+	var show oaShowResponse
+	if json.NewDecoder(resp.Body).Decode(&show) != nil {
+		return
+	}
+	c.noteThinking(model, alwaysThinks(show.Capabilities, show.Template))
 }
