@@ -278,16 +278,57 @@ func TestDirectServeGoodRequest(t *testing.T) {
 	}
 }
 
-// TestDirectServeClampsMaxTokens: an ask past the ticket's cap runs at
-// the cap.
-func TestDirectServeClampsMaxTokens(t *testing.T) {
+// TestDirectServeCapIsNotTheAsk (field, 2026-11-26): the ticket's cap is
+// a billing ceiling, never handed to the backend as max_tokens — with no
+// ask the router sets it to the whole window, and a backend handed that
+// answered nothing. No ask, or an ask at or past the cap: the backend
+// gets none (its default, as on the relay path).
+func TestDirectServeCapIsNotTheAsk(t *testing.T) {
+	for _, ask := range []int{0, 64, 9999} {
+		f := newDirectServeFixture(t, t.TempDir())
+		f.directRoundTrip(f.ticket(nil), wire.InferenceRequestData{Model: "qwen3:4b",
+			Messages: []wire.InferenceMessage{{Role: "user", Content: "hi"}}, MaxTokens: ask}, "req-cap")
+		if got := <-f.lastReq; got.MaxTokens != 0 {
+			t.Fatalf("ask %d: backend max_tokens = %d, want 0 (the backend's default)", ask, got.MaxTokens)
+		}
+	}
+}
+
+// TestDirectServeStopsAtTheCap: the cap is kept by the node itself — a
+// backend that streams past it is stopped at cap chunks, and the answer
+// ends normally with finish "length".
+func TestDirectServeStopsAtTheCap(t *testing.T) {
 	f := newDirectServeFixture(t, t.TempDir())
-	tk := f.ticket(nil)
-	f.directRoundTrip(tk, wire.InferenceRequestData{Model: "qwen3:4b",
-		Messages: []wire.InferenceMessage{{Role: "user", Content: "hi"}}, MaxTokens: 9999}, "req-clamp")
-	got := <-f.lastReq
-	if got.MaxTokens != 64 {
-		t.Fatalf("max_tokens = %d, want clamped to the ticket's 64", got.MaxTokens)
+	f.setScript(func(ctx context.Context, req wire.InferenceRequestData, emit func(wire.InferenceChunkData) error) (wire.InferenceDoneData, error) {
+		for i := 0; i < 200; i++ {
+			if err := emit(wire.InferenceChunkData{Content: "x"}); err != nil {
+				return wire.InferenceDoneData{}, err
+			}
+		}
+		return wire.InferenceDoneData{InputTokens: 10, OutputTokens: 200}, nil
+	})
+	envs := f.directRoundTrip(f.ticket(nil), wire.InferenceRequestData{Model: "qwen3:4b",
+		Messages: []wire.InferenceMessage{{Role: "user", Content: "hi"}}}, "req-stop")
+	content, finish, done := 0, "", false
+	for _, env := range envs {
+		switch env.Type {
+		case wire.TypeInferenceChunk:
+			var c wire.InferenceChunkData
+			_ = json.Unmarshal(env.Data, &c)
+			if c.Content != "" {
+				content++
+			}
+			if c.FinishReason != "" {
+				finish = c.FinishReason
+			}
+		case wire.TypeInferenceDone:
+			done = true
+		case wire.TypeInferenceError:
+			t.Fatalf("the cap ended in an error: %s", env.Data)
+		}
+	}
+	if content != 64 || finish != "length" || !done {
+		t.Fatalf("content chunks = %d (want the ticket's 64), finish = %q, done = %v", content, finish, done)
 	}
 }
 

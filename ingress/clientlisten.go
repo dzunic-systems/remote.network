@@ -477,10 +477,22 @@ func (l *ClientListener) serveDirectRequest(stream *quic.Stream, peer string, en
 		refuse(d.RequestID, "ticket_revoked", "ticket was revoked")
 		return
 	}
-	// The ticket's output cap is what the reservation covered: the
-	// request's ask (or a default) never exceeds it.
-	if t.MaxTokens > 0 && (d.Request.MaxTokens <= 0 || d.Request.MaxTokens > t.MaxTokens) {
-		d.Request.MaxTokens = t.MaxTokens
+	// The ticket's output cap is what the reservation covered — a billing
+	// ceiling, not a generation size. With no ask, the router sets it to the
+	// card's whole window, and a backend handed max_tokens = window (plus
+	// any prompt) refuses or answers nothing (field, 2026-11-26: TensorFold
+	// on GB10 returned an empty answer in 1 ms). So the backend gets the
+	// request's own ask only when it is under the cap, and otherwise none —
+	// its default, exactly what the relay path sends — and the cap is kept
+	// here instead: the answer ends at cap chunks with finish "length".
+	// (A client that filled the ask with the cap — remote-client ≤ v0.1.7
+	// — counts as no ask.)
+	capChunks := 0
+	if t.MaxTokens > 0 {
+		if d.Request.MaxTokens <= 0 || d.Request.MaxTokens >= t.MaxTokens {
+			d.Request.MaxTokens = 0
+			capChunks = t.MaxTokens
+		}
 	}
 	// The stream's life is the request's; a revoke cancels it mid-flight.
 	sctx, cancel := context.WithCancel(context.Background())
@@ -496,13 +508,41 @@ func (l *ClientListener) serveDirectRequest(stream *quic.Stream, peer string, en
 
 	_ = stream.SetReadDeadline(time.Time{}) // the answer now governs
 	start := time.Now()
+	sent := 0
+	capHit := false
 	done, code, err := l.core.run(sctx, d.RequestID, d.Request, func(chunk wire.InferenceChunkData) error {
+		if capChunks > 0 && sent >= capChunks {
+			capHit = true
+			return errTicketCap // stops the backend; the answer ends below
+		}
 		reply, werr := wire.NewReq(wire.TypeInferenceChunk, l.nodeID, d.RequestID, chunk)
 		if werr != nil {
 			return werr
 		}
-		return clientproto.WriteEnvelope(stream, reply, writeWait)
+		if werr = clientproto.WriteEnvelope(stream, reply, writeWait); werr == nil {
+			sent++
+		}
+		return werr
 	}, t.ID)
+	if capHit {
+		// The ticket's cap ended the answer: a normal end with finish
+		// "length", not an error. The receipt run signed bills what was
+		// sent (failed_mid_stream status: the backend did not finish).
+		if done.Receipt != nil {
+			l.queue.enqueue(*done.Receipt, t.RouterID)
+		}
+		if reply, werr := wire.NewReq(wire.TypeInferenceChunk, l.nodeID, d.RequestID,
+			wire.InferenceChunkData{FinishReason: "length"}); werr == nil {
+			_ = clientproto.WriteEnvelope(stream, reply, writeWait)
+		}
+		end := wire.InferenceDoneData{InputTokens: done.InputTokens, OutputTokens: sent}
+		if reply, werr := wire.NewReq(wire.TypeInferenceDone, l.nodeID, d.RequestID, end); werr == nil {
+			_ = clientproto.WriteEnvelope(stream, reply, writeWait)
+		}
+		l.log.Info("direct request stopped at the ticket's output cap", "request_id", d.RequestID,
+			"model", d.Request.Model, "chunks", sent)
+		return
+	}
 	// The receipt is queued (on disk) BEFORE the consumer hears the end:
 	// the answer is out, and the record that bills it must not depend on
 	// this process surviving the next write. A request cut off after
@@ -810,3 +850,6 @@ func lanAddrs() []net.IP {
 	}
 	return out
 }
+
+// errTicketCap stops a direct answer at its ticket's output cap.
+var errTicketCap = errors.New("the ticket's output cap is reached")
